@@ -15,14 +15,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cubus.sh/admin/internal/config"
 )
 
 const (
-	serviceCallTimeout = 10 * time.Second
-	serviceMaxResp     = 2 << 20
+	serviceCallTimeout   = 10 * time.Second
+	manifestProbeTimeout = 2 * time.Second
+	serviceMaxResp       = 2 << 20
 )
 
 var (
@@ -135,36 +137,48 @@ func (c *ServiceClient) discoverTargets(ctx context.Context) map[string]resolved
 
 func (c *ServiceClient) ListServices(ctx context.Context) []ServiceSummary {
 	targets := c.discoverTargets(ctx)
-	out := make([]ServiceSummary, 0, len(targets))
+	list := make([]resolvedTarget, 0, len(targets))
 	for _, t := range targets {
-		sum := ServiceSummary{
-			Service:         t.Service,
-			Name:            t.Name,
-			State:           t.State,
-			Health:          t.Health,
-			TokenConfigured: t.Token != "",
-		}
-		if t.Token == "" {
-			sum.Error = fmt.Sprintf("Set ADMIN_TOKEN_%s in admin .env (and matching ADMIN_API_TOKEN in %s .env)", strings.ToUpper(config.NormalizeServiceKey(t.Service)), t.Service)
-			out = append(out, sum)
-			continue
-		}
-		raw, status, err := c.callTarget(ctx, t, http.MethodGet, "/admin/v1/manifest", nil, nil)
-		if err != nil {
-			sum.Error = "admin API unreachable (ensure ADMIN_API_TOKEN is enabled on the service)"
-		} else if status != http.StatusOK {
-			sum.Error = fmt.Sprintf("manifest returned HTTP %d", status)
-		} else {
-			var man struct {
-				Capabilities []string `json:"capabilities"`
-			}
-			if json.Unmarshal(raw, &man) == nil {
-				sum.Reachable = true
-				sum.Capabilities = man.Capabilities
-			}
-		}
-		out = append(out, sum)
+		list = append(list, t)
 	}
+	out := make([]ServiceSummary, len(list))
+	var wg sync.WaitGroup
+	for i, t := range list {
+		wg.Add(1)
+		go func(idx int, target resolvedTarget) {
+			defer wg.Done()
+			sum := ServiceSummary{
+				Service:         target.Service,
+				Name:            target.Name,
+				State:           target.State,
+				Health:          target.Health,
+				TokenConfigured: target.Token != "",
+			}
+			if target.Token == "" {
+				sum.Error = fmt.Sprintf("Set ADMIN_TOKEN_%s in admin .env (and matching ADMIN_API_TOKEN in %s .env)", strings.ToUpper(config.NormalizeServiceKey(target.Service)), target.Service)
+				out[idx] = sum
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, manifestProbeTimeout)
+			defer cancel()
+			raw, status, err := c.callTarget(probeCtx, target, http.MethodGet, "/admin/v1/manifest", nil, nil)
+			if err != nil {
+				sum.Error = "admin API unreachable (ensure ADMIN_API_TOKEN is enabled on the service)"
+			} else if status != http.StatusOK {
+				sum.Error = fmt.Sprintf("manifest returned HTTP %d", status)
+			} else {
+				var man struct {
+					Capabilities []string `json:"capabilities"`
+				}
+				if json.Unmarshal(raw, &man) == nil {
+					sum.Reachable = true
+					sum.Capabilities = man.Capabilities
+				}
+			}
+			out[idx] = sum
+		}(i, t)
+	}
+	wg.Wait()
 	sort.Slice(out, func(i, j int) bool { return out[i].Service < out[j].Service })
 	return out
 }
@@ -215,6 +229,9 @@ func (c *ServiceClient) callTarget(ctx context.Context, t resolvedTarget, method
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, serviceMaxResp))
 	if err != nil {
 		return nil, http.StatusBadGateway, err
+	}
+	if len(respBody) > 0 && !json.Valid(respBody) {
+		return nil, http.StatusBadGateway, errors.New("service admin API returned invalid JSON")
 	}
 	return json.RawMessage(respBody), resp.StatusCode, nil
 }

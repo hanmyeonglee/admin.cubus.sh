@@ -167,15 +167,21 @@ func (a *Authenticator) DestroySession(ctx context.Context, w http.ResponseWrite
 	if c, err := r.Cookie(a.sessionCookie); err == nil && c.Value != "" {
 		_ = a.store.DeleteSession(ctx, SHA256Bytes(c.Value))
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     a.sessionCookie,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   a.cfg.PublicIsHTTPS,
-		SameSite: http.SameSiteLaxMode,
-	})
+	for _, name := range []string{a.sessionCookie, a.cfCSRFCookie} {
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   a.cfg.PublicIsHTTPS,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+}
+
+func (a *Authenticator) VerifyCloudflareEmail(ctx context.Context, r *http.Request) (string, error) {
+	return a.verifyCF(ctx, r)
 }
 
 func (a *Authenticator) currentSession(ctx context.Context, r *http.Request) (store.AdminSession, bool) {
@@ -202,7 +208,8 @@ func (a *Authenticator) Authenticate(w http.ResponseWriter, r *http.Request) (Pr
 	switch a.cfg.AuthMode {
 	case config.AuthModeDev:
 		peer := ExtractTCPPeerIP(r)
-		if !a.cfg.PublicIsLoopback || !peer.IsLoopback() {
+		allowedPeer := peer.IsLoopback() || (a.cfg.DevAllowPrivateBridge && peer.IsPrivate())
+		if !a.cfg.PublicIsLoopback || !allowedPeer {
 			return Principal{}, false, errors.New("dev auth restricted to loopback")
 		}
 		tok := a.ensureStatelessCSRF(w, r, a.cfg.DevAuthEmail)
@@ -301,26 +308,28 @@ func (a *Authenticator) verifyCF(ctx context.Context, r *http.Request) (string, 
 
 // ensureStatelessCSRF binds an HMAC-signed CSRF token to email in an HttpOnly cookie
 // for stateless auth modes (Cloudflare Access / dev).
+// When w == nil (API/write paths), it only reads an existing valid cookie without mutating it.
 func (a *Authenticator) ensureStatelessCSRF(w http.ResponseWriter, r *http.Request, email string) string {
 	if c, err := r.Cookie(a.cfCSRFCookie); err == nil && a.verifyHMACCSRF(email, c.Value) {
 		return c.Value
+	}
+	if w == nil {
+		return ""
 	}
 	nonce, err := RandomToken(24)
 	if err != nil {
 		return ""
 	}
 	tok := a.signHMACCSRF(email, nonce)
-	if w != nil {
-		http.SetCookie(w, &http.Cookie{
-			Name:     a.cfCSRFCookie,
-			Value:    tok,
-			Path:     "/",
-			MaxAge:   int(cfCSRFCookieTTL.Seconds()),
-			HttpOnly: true,
-			Secure:   a.cfg.PublicIsHTTPS,
-			SameSite: http.SameSiteLaxMode,
-		})
-	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     a.cfCSRFCookie,
+		Value:    tok,
+		Path:     "/",
+		MaxAge:   int(cfCSRFCookieTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   a.cfg.PublicIsHTTPS,
+		SameSite: http.SameSiteLaxMode,
+	})
 	return tok
 }
 

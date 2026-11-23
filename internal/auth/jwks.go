@@ -24,6 +24,7 @@ const (
 	jwksMaxRespBytes      = 256 << 10
 	jwksHTTPTimeout       = 10 * time.Second
 	maxJWTBytes           = 8 << 10
+	minRSABits            = 2048
 )
 
 type jwksDocument struct {
@@ -42,15 +43,20 @@ type jwkKey struct {
 	Y   string `json:"y"`
 }
 
+type jwksRefreshCall struct {
+	done chan struct{}
+	err  error
+}
+
 type JWKSCache struct {
 	url    string
 	client *http.Client
 
-	mu               sync.RWMutex
-	keys             map[string]any
-	fetchedAt        time.Time
-	lastForcedRefetch time.Time
-	refreshInflight  chan struct{}
+	mu                 sync.RWMutex
+	keys               map[string]any
+	fetchedAt          time.Time
+	lastRefreshAttempt time.Time
+	inflight           *jwksRefreshCall
 }
 
 func NewJWKSCache(jwksURL string, client *http.Client) *JWKSCache {
@@ -78,9 +84,10 @@ func (c *JWKSCache) GetKey(ctx context.Context, kid string) (any, error) {
 		return k, nil
 	}
 
-	force := !ok && fresh
-	if err := c.refresh(ctx, force); err != nil {
-		// Fall back to stale key if already cached and upstream transiently failed.
+	// Throttle repeated refreshes triggered by unknown kids OR post-failure retries,
+	// regardless of whether the cache is currently fresh or stale/empty.
+	throttled := !ok
+	if err := c.refresh(ctx, throttled); err != nil {
 		if ok {
 			return k, nil
 		}
@@ -96,37 +103,49 @@ func (c *JWKSCache) GetKey(ctx context.Context, kid string) (any, error) {
 	return k, nil
 }
 
-func (c *JWKSCache) refresh(ctx context.Context, forcedByUnknownKid bool) error {
+func (c *JWKSCache) refresh(ctx context.Context, applyCooldown bool) error {
 	c.mu.Lock()
-	if c.refreshInflight != nil {
-		ch := c.refreshInflight
+	if call := c.inflight; call != nil {
 		c.mu.Unlock()
 		select {
-		case <-ch:
-			return nil
+		case <-call.done:
+			return call.err
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	// Rate-limit unknown-kid forced refreshes to prevent unauthenticated JWKS fetch DoS.
-	if forcedByUnknownKid && !c.lastForcedRefetch.IsZero() && time.Since(c.lastForcedRefetch) < jwksUnknownKidCooloff {
+	if applyCooldown && !c.lastRefreshAttempt.IsZero() && time.Since(c.lastRefreshAttempt) < jwksUnknownKidCooloff {
 		c.mu.Unlock()
-		return errors.New("unknown kid refresh throttled")
+		return errors.New("JWKS refresh throttled")
 	}
-	if forcedByUnknownKid {
-		c.lastForcedRefetch = time.Now()
-	}
-	ch := make(chan struct{})
-	c.refreshInflight = ch
+	c.lastRefreshAttempt = time.Now()
+	call := &jwksRefreshCall{done: make(chan struct{})}
+	c.inflight = call
 	c.mu.Unlock()
 
-	defer func() {
+	go func() {
+		// Use an independent bounded context so one caller canceling cannot poison
+		// all coalesced waiters sharing this refresh.
+		fetchCtx, cancel := context.WithTimeout(context.Background(), jwksHTTPTimeout)
+		defer cancel()
+		err := c.fetchOnce(fetchCtx)
+
 		c.mu.Lock()
-		c.refreshInflight = nil
-		close(ch)
+		call.err = err
+		c.inflight = nil
+		close(call.done)
 		c.mu.Unlock()
 	}()
 
+	select {
+	case <-call.done:
+		return call.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *JWKSCache) fetchOnce(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
 	if err != nil {
 		return err
@@ -183,7 +202,6 @@ func (c *JWKSCache) VerifyJWT(ctx context.Context, rawToken string, allowedAlgs 
 	)
 	claims := jwt.MapClaims{}
 	tok, err := parser.ParseWithClaims(rawToken, claims, func(t *jwt.Token) (any, error) {
-		// Reject dangerous header parameters that attempt dynamic key injection.
 		for _, bad := range []string{"jku", "x5u", "jwk"} {
 			if _, exists := t.Header[bad]; exists {
 				return nil, fmt.Errorf("forbidden JWT header %q", bad)
@@ -199,27 +217,31 @@ func (c *JWKSCache) VerifyJWT(ctx context.Context, rawToken string, allowedAlgs 
 }
 
 func parseJWKPublicKey(k jwkKey) (any, error) {
+	if k.Use != "" && k.Use != "sig" {
+		return nil, fmt.Errorf("unsupported JWK use %q", k.Use)
+	}
 	switch k.Kty {
 	case "RSA":
 		nb, err := base64.RawURLEncoding.DecodeString(k.N)
 		if err != nil || len(nb) == 0 {
 			return nil, errors.New("invalid RSA modulus")
 		}
+		n := new(big.Int).SetBytes(nb)
+		if n.BitLen() < minRSABits {
+			return nil, fmt.Errorf("RSA key modulus too small (%d bits)", n.BitLen())
+		}
 		eb, err := base64.RawURLEncoding.DecodeString(k.E)
-		if err != nil || len(eb) == 0 {
+		if err != nil || len(eb) == 0 || len(eb) > 4 {
 			return nil, errors.New("invalid RSA exponent")
 		}
 		e := 0
 		for _, b := range eb {
 			e = e<<8 | int(b)
 		}
-		if e < 3 {
+		if e < 3 || e%2 == 0 {
 			return nil, errors.New("invalid RSA exponent value")
 		}
-		return &rsa.PublicKey{
-			N: new(big.Int).SetBytes(nb),
-			E: e,
-		}, nil
+		return &rsa.PublicKey{N: n, E: e}, nil
 
 	case "EC":
 		var curve elliptic.Curve

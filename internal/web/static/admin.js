@@ -314,7 +314,11 @@
     es.onerror = () => {
       if (statusBox) {
         clear(statusBox);
-        statusBox.appendChild(el("span", "pill pill-warn", "Reconnecting..."));
+        if (es.readyState === EventSource.CLOSED) {
+          statusBox.appendChild(el("span", "pill pill-err", "Disconnected (reload to re-auth)"));
+        } else {
+          statusBox.appendChild(el("span", "pill pill-warn", "Reconnecting..."));
+        }
       }
     };
   }
@@ -431,7 +435,12 @@
         } catch {}
       };
       tailES.onerror = () => {
-        meta.textContent = "Stream interrupted; reconnecting...";
+        if (tailES && tailES.readyState === EventSource.CLOSED) {
+          stopTail();
+          meta.textContent = "Stream closed (session expired or concurrency limit reached).";
+        } else {
+          meta.textContent = "Stream interrupted; reconnecting...";
+        }
       };
     });
 
@@ -557,13 +566,16 @@
       const fields = schema.length > 0 ? schema : Object.keys(current).map((k) => ({
         key: k,
         label: k,
-        type: Array.isArray(current[k]) ? "string_list" : (typeof current[k] === "boolean" ? "bool" : "int")
+        type: Array.isArray(current[k]) ? "string_list"
+          : (typeof current[k] === "boolean" ? "bool"
+          : (typeof current[k] === "number" ? (Number.isInteger(current[k]) ? "int" : "float") : "string"))
       }));
 
       fields.forEach((f) => {
         const grp = el("div", "form-field");
         const val = current[f.key];
-        if (f.type === "bool") {
+        const fieldType = f.type || "string";
+        if (fieldType === "bool") {
           const lbl = el("label", "check-inline");
           const cb = el("input");
           cb.type = "checkbox";
@@ -572,21 +584,30 @@
           lbl.appendChild(el("span", "", f.label || f.key));
           grp.appendChild(lbl);
           inputs[f.key] = { type: "bool", node: cb };
-        } else if (f.type === "string_list") {
+        } else if (fieldType === "string_list") {
           grp.appendChild(el("label", "", f.label || f.key));
           const ta = el("textarea");
           ta.value = Array.isArray(val) ? val.join("\n") : "";
           grp.appendChild(ta);
           inputs[f.key] = { type: "string_list", node: ta };
-        } else {
+        } else if (fieldType === "int" || fieldType === "float") {
           grp.appendChild(el("label", "", f.label || f.key));
           const inp = el("input");
           inp.type = "number";
+          inp.required = true;
+          inp.step = fieldType === "int" ? "1" : "any";
           if (f.min !== undefined) inp.min = String(f.min);
           if (f.max !== undefined) inp.max = String(f.max);
-          inp.value = val !== undefined ? String(val) : "";
+          inp.value = (val !== undefined && val !== null) ? String(val) : "";
           grp.appendChild(inp);
-          inputs[f.key] = { type: "int", node: inp };
+          inputs[f.key] = { type: fieldType, node: inp };
+        } else {
+          grp.appendChild(el("label", "", f.label || f.key));
+          const inp = el("input");
+          inp.type = "text";
+          inp.value = (val !== undefined && val !== null) ? String(val) : "";
+          grp.appendChild(inp);
+          inputs[f.key] = { type: "string", node: inp };
         }
         if (f.help) grp.appendChild(el("div", "form-help", f.help));
         form.appendChild(grp);
@@ -599,14 +620,24 @@
       form.addEventListener("submit", async (e) => {
         e.preventDefault();
         const patch = {};
-        Object.keys(inputs).forEach((k) => {
+        for (const k of Object.keys(inputs)) {
           const it = inputs[k];
-          if (it.type === "bool") patch[k] = it.node.checked;
-          else if (it.type === "int") patch[k] = Number(it.node.value);
-          else if (it.type === "string_list") {
+          if (it.type === "bool") {
+            patch[k] = it.node.checked;
+          } else if (it.type === "int" || it.type === "float") {
+            const raw = it.node.value.trim();
+            const num = Number(raw);
+            if (raw === "" || Number.isNaN(num) || (it.type === "int" && !Number.isInteger(num))) {
+              showToast("Invalid numeric value for " + k, true);
+              return;
+            }
+            patch[k] = num;
+          } else if (it.type === "string_list") {
             patch[k] = it.node.value.split("\n").map((s) => s.trim()).filter(Boolean);
+          } else {
+            patch[k] = it.node.value;
           }
-        });
+        }
         try {
           await apiFetch("/api/services/" + encodeURIComponent(activeService) + "/settings", {
             method: "PATCH",
@@ -624,6 +655,7 @@
     }
 
     async function renderArtifactsTab(container, queryStr) {
+      const prevParams = new URLSearchParams(queryStr || "");
       const qs = queryStr ? ("?" + queryStr) : "";
       const data = await apiFetch("/api/services/" + encodeURIComponent(activeService) + "/artifacts" + qs);
       clear(container);
@@ -632,13 +664,16 @@
       const qInp = el("input");
       qInp.type = "text";
       qInp.placeholder = "Search title...";
+      qInp.value = prevParams.get("q") || "";
       const ownerInp = el("input");
       ownerInp.type = "text";
       ownerInp.placeholder = "Owner username...";
+      ownerInp.value = prevParams.get("owner") || "";
       const visSel = el("select");
       [["", "All visibility"], ["private", "Private"], ["public", "Public"]].forEach(([v, label]) => {
         const o = el("option", "", label);
         o.value = v;
+        if (v === (prevParams.get("visibility") || "")) o.selected = true;
         visSel.appendChild(o);
       });
       const goBtn = el("button", "btn btn-primary", "Filter");

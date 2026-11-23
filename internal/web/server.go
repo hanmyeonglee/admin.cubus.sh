@@ -160,7 +160,7 @@ func (s *Server) requireAuthAPI(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		p, needsRedirect, err := s.auth.Authenticate(w, r)
+		p, needsRedirect, err := s.auth.Authenticate(nil, r)
 		if err != nil {
 			code := http.StatusForbidden
 			if needsRedirect {
@@ -177,7 +177,8 @@ func (s *Server) requireAuthWrite(next http.Handler) http.Handler {
 	guarded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		p, needsRedirect, err := s.auth.Authenticate(w, r)
+		// Pass nil for ResponseWriter so rejected writes never mutate the CSRF cookie.
+		p, needsRedirect, err := s.auth.Authenticate(nil, r)
 		if err != nil {
 			code := http.StatusForbidden
 			if needsRedirect {
@@ -272,6 +273,14 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("rejected unauthorized google login", "email", id.Email, "ip", auth.ExtractClientIP(r))
 		s.renderLogin(w, http.StatusForbidden, "/", "Your Google account is not authorized to access admin.cubus.sh.", "")
 		return
+	}
+	if s.cfg.AuthMode == config.AuthModeCloudflareAndGoogle {
+		cfEmail, cfErr := s.auth.VerifyCloudflareEmail(r.Context(), r)
+		if cfErr != nil || cfEmail != id.Email {
+			s.logger.Warn("rejected google login mismatched with cloudflare access", "google_email", id.Email, "cf_err", cfErr)
+			s.renderLogin(w, http.StatusForbidden, "/", "Google account email must match your Cloudflare Access identity.", "")
+			return
+		}
 	}
 	s.auth.DestroySession(r.Context(), w, r)
 	if _, err := s.auth.CreateSession(r.Context(), w, id.Email, id.Name); err != nil {
@@ -405,13 +414,15 @@ func (s *Server) handleStreamMetrics(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		case <-tick.C:
+			tickCtx, cancelTick := context.WithTimeout(streamCtx, 3*time.Second)
 			payload := map[string]any{}
-			if sys, err := s.ops.GetSystemRaw(streamCtx); err == nil {
+			if sys, err := s.ops.GetSystemRaw(tickCtx); err == nil {
 				payload["system"] = sys
 			}
-			if cnt, err := s.ops.GetContainersRaw(streamCtx); err == nil {
+			if cnt, err := s.ops.GetContainersRaw(tickCtx); err == nil {
 				payload["containers"] = cnt
 			}
+			cancelTick()
 			if len(payload) == 0 {
 				continue
 			}
@@ -564,7 +575,7 @@ func (s *Server) handleServiceUserDeny(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleServiceUserDecision(w http.ResponseWriter, r *http.Request, action string) {
-	svc := r.PathValue("name")
+	svc := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
 	id, err := clients.ValidateResourceID(r.PathValue("id"))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid user id"})
@@ -583,7 +594,7 @@ func (s *Server) handleServiceUserDecision(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleServiceSettingsPatch(w http.ResponseWriter, r *http.Request) {
-	svc := r.PathValue("name")
+	svc := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
 	r.Body = http.MaxBytesReader(w, r.Body, maxMutationBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -607,7 +618,7 @@ func (s *Server) handleServiceSettingsPatch(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleServiceArtifactDelete(w http.ResponseWriter, r *http.Request) {
-	svc := r.PathValue("name")
+	svc := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
 	id, err := clients.ValidateResourceID(r.PathValue("id"))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid artifact id"})
@@ -657,12 +668,16 @@ func (s *Server) recordAudit(ctx context.Context, p auth.Principal, r *http.Requ
 		ActorEmail:    p.Email,
 		AuthMethod:    p.AuthMethod,
 		Action:        action,
-		TargetService: service,
+		TargetService: strings.ToLower(strings.TrimSpace(service)),
 		TargetID:      targetID,
 		Details:       details,
 		ClientIP:      auth.ExtractClientIP(r),
 	}
-	if err := s.store.AppendAuditLog(ctx, entry); err != nil {
+	// Detach from request cancellation so a browser closing immediately after a 2xx
+	// mutation cannot drop the audit record.
+	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := s.store.AppendAuditLog(auditCtx, entry); err != nil {
 		// Structured fallback so audit trail survives transient DB write failures.
 		s.logger.Error("audit_log_fallback",
 			"err", err,
@@ -698,9 +713,16 @@ func setSecurityHeaders(w http.ResponseWriter) {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"failed to encode response"}`))
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(data)
 }
 
 func writeRawJSON(w http.ResponseWriter, status int, raw json.RawMessage) {

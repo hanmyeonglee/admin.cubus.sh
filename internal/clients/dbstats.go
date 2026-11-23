@@ -56,5 +56,8 @@ func (c *DBStatsClient) GetRaw(ctx context.Context) (json.RawMessage, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("db-broker stats returned status %d", resp.StatusCode)
 	}
+	if !json.Valid(body) {
+		return nil, fmt.Errorf("db-broker stats returned invalid JSON")
+	}
 	return json.RawMessage(body), nil
 }

@@ -103,6 +103,9 @@ func (c *OpsClient) SearchLogsRaw(ctx context.Context, q url.Values) (json.RawMe
 	if err != nil {
 		return nil, http.StatusBadGateway, err
 	}
+	if !json.Valid(body) {
+		return nil, http.StatusBadGateway, errors.New("ops-agent returned invalid JSON")
+	}
 	return json.RawMessage(body), resp.StatusCode, nil
 }
 
@@ -147,6 +150,9 @@ func (c *OpsClient) getRaw(ctx context.Context, path string) (json.RawMessage, e
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("ops-agent %s returned status %d", path, resp.StatusCode)
+	}
+	if !json.Valid(body) {
+		return nil, fmt.Errorf("ops-agent %s returned invalid JSON", path)
 	}
 	return json.RawMessage(body), nil
 }

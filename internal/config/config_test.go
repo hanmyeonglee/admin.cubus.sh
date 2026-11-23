@@ -104,6 +104,18 @@ func TestLoadRejectsInsecureConfigurations(t *testing.T) {
 				"GOOGLE_CLIENT_SECRET": "replace-with-google-client-secret",
 			},
 		},
+		{
+			name: "dev private bridge on non-loopback",
+			env: map[string]string{
+				"PUBLIC_BASE_URL":          "https://admin.cubus.sh",
+				"DATABASE_URL":             "postgres://u:p@localhost/db",
+				"AUTH_MODE":                "google",
+				"ADMIN_ALLOWED_EMAILS":     "me@cubus.sh",
+				"GOOGLE_CLIENT_ID":         "cid",
+				"GOOGLE_CLIENT_SECRET":     "real-secret",
+				"DEV_ALLOW_PRIVATE_BRIDGE": "true",
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -112,5 +124,11 @@ func TestLoadRejectsInsecureConfigurations(t *testing.T) {
 				t.Fatalf("expected error for %s", tc.name)
 			}
 		})
+	}
+
+	// IPv6 loopback URL retains brackets when default port is omitted.
+	got, _, isLoop, err := NormalizePublicBaseURL("http://[::1]:80")
+	if err != nil || !isLoop || got != "http://[::1]" {
+		t.Fatalf("expected http://[::1], got (%q, loop=%v, err=%v)", got, isLoop, err)
 	}
 }

@@ -39,11 +39,12 @@ type Config struct {
 	AllowedEmails      map[string]struct{}
 	CFAccessTeamDomain string
 	CFAccessAUD        string
-	GoogleClientID     string
-	GoogleClientSecret string
-	DevAuthEmail       string
-	ServiceTokens      map[string]string
-	StaticServices     map[string]string
+	GoogleClientID        string
+	GoogleClientSecret    string
+	DevAuthEmail          string
+	DevAllowPrivateBridge bool
+	ServiceTokens         map[string]string
+	StaticServices        map[string]string
 }
 
 func (c Config) LogValue() slog.Value {
@@ -100,10 +101,11 @@ func Load(getenv func(string) string, environ func() []string) (Config, error) {
 		AuthMode:           strings.ToLower(strings.TrimSpace(getenv("AUTH_MODE"))),
 		CFAccessTeamDomain: strings.TrimRight(strings.ToLower(strings.TrimSpace(getenv("CF_ACCESS_TEAM_DOMAIN"))), "/"),
 		CFAccessAUD:        strings.TrimSpace(getenv("CF_ACCESS_AUD")),
-		GoogleClientID:     strings.TrimSpace(getenv("GOOGLE_CLIENT_ID")),
-		GoogleClientSecret: strings.TrimSpace(getenv("GOOGLE_CLIENT_SECRET")),
-		DevAuthEmail:       strings.ToLower(strings.TrimSpace(getenv("DEV_AUTH_EMAIL"))),
-		AllowedEmails:      make(map[string]struct{}),
+		GoogleClientID:        strings.TrimSpace(getenv("GOOGLE_CLIENT_ID")),
+		GoogleClientSecret:    strings.TrimSpace(getenv("GOOGLE_CLIENT_SECRET")),
+		DevAuthEmail:          strings.ToLower(strings.TrimSpace(getenv("DEV_AUTH_EMAIL"))),
+		DevAllowPrivateBridge: strings.EqualFold(strings.TrimSpace(getenv("DEV_ALLOW_PRIVATE_BRIDGE")), "true"),
+		AllowedEmails:         make(map[string]struct{}),
 		ServiceTokens:      make(map[string]string),
 		StaticServices:     make(map[string]string),
 	}
@@ -136,7 +138,10 @@ func Load(getenv func(string) string, environ func() []string) (Config, error) {
 		cfg.AdminNetworkCIDR = &pfx
 	}
 
-	// DEV_AUTH_EMAIL is strictly forbidden on non-loopback PUBLIC_BASE_URL.
+	// DEV_AUTH_EMAIL / DEV_ALLOW_PRIVATE_BRIDGE are strictly forbidden on non-loopback PUBLIC_BASE_URL.
+	if cfg.DevAllowPrivateBridge && (!cfg.PublicIsLoopback || (cfg.AuthMode != "" && cfg.AuthMode != AuthModeDev)) {
+		return Config{}, errors.New("DEV_ALLOW_PRIVATE_BRIDGE is only permitted with AUTH_MODE=dev on loopback PUBLIC_BASE_URL")
+	}
 	if cfg.DevAuthEmail != "" {
 		if !cfg.PublicIsLoopback {
 			return Config{}, errors.New("DEV_AUTH_EMAIL is forbidden when PUBLIC_BASE_URL is non-loopback")
@@ -275,12 +280,16 @@ func NormalizePublicBaseURL(raw string) (canonical string, isHTTPS bool, isLoopb
 		return "", false, false, fmt.Errorf("unsupported PUBLIC_BASE_URL scheme %q", u.Scheme)
 	}
 	port := u.Port()
+	hostBracketed := host
+	if strings.Contains(host, ":") {
+		hostBracketed = "[" + host + "]"
+	}
 	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
-		u.Host = host
+		u.Host = hostBracketed
 	} else if port != "" {
 		u.Host = net.JoinHostPort(host, port)
 	} else {
-		u.Host = host
+		u.Host = hostBracketed
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
 	if u.Path != "" {

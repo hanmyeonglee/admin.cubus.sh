@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -103,9 +104,13 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("initialize web server: %w", err)
 	}
 
+	srvCtx, cancelSrv := context.WithCancel(context.Background())
+	defer cancelSrv()
+
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           webSrv.Handler(),
+		BaseContext:       func(net.Listener) context.Context { return srvCtx },
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second, // Extended per-event for SSE via ResponseController
@@ -151,6 +156,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	cancelBg()
+	cancelSrv() // Cancel active SSE request contexts immediately so graceful shutdown finishes promptly.
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancelShutdown()
 	_ = httpSrv.Shutdown(shutdownCtx)

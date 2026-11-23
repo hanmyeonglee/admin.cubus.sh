@@ -131,13 +131,17 @@ func TestAdminWebEndToEndProxyAuditCSRFAndSSE(t *testing.T) {
 		t.Fatalf("unexpected overview: %d %s", ovRec.Code, ovRec.Body.String())
 	}
 
-	// 4. Write without CSRF fails with 403; cross-site write fails with 403.
+	// 4. Write without CSRF fails with 403 and MUST NOT emit Set-Cookie (no CSRF cookie desync);
+	//    cross-site write fails with 403.
 	noCSRF := httptest.NewRequest(http.MethodPost, "/api/services/artifact/users/u-123/approve", nil)
 	noCSRF.RemoteAddr = "127.0.0.1:50003"
 	noCSRFRec := httptest.NewRecorder()
 	h.ServeHTTP(noCSRFRec, noCSRF)
 	if noCSRFRec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 without CSRF token, got %d", noCSRFRec.Code)
+	}
+	if len(noCSRFRec.Result().Cookies()) != 0 {
+		t.Fatalf("rejected 403 write unexpectedly mutated cookies: %+v", noCSRFRec.Result().Cookies())
 	}
 
 	xSite := httptest.NewRequest(http.MethodPost, "/api/services/artifact/users/u-123/approve", nil)
