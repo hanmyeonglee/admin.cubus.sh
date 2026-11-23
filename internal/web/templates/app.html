@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="csrf-token" content="{{.CSRFToken}}">
+  <title>{{.PageTitle}} · admin.cubus.sh</title>
+  <link rel="stylesheet" href="/static/admin.css">
+  <script src="/static/admin.js" defer></script>
+</head>
+<body data-page="{{.Page}}" data-service="{{.ActiveService}}">
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <a class="brand" href="/">admin.cubus.sh</a>
+        <span class="pill pill-muted">control plane</span>
+      </div>
+
+      <nav class="nav">
+        <div class="nav-label">Platform</div>
+        <a class="nav-link {{if eq .Page "overview"}}active{{end}}" href="/">Overview &amp; Hardware</a>
+        <a class="nav-link {{if eq .Page "logs"}}active{{end}}" href="/logs">Log Explorer</a>
+        <a class="nav-link {{if eq .Page "audit"}}active{{end}}" href="/audit">Audit Log</a>
+
+        <div class="nav-label">Managed Services</div>
+        <div id="nav-services">
+          {{range .Services}}
+            <a class="nav-link {{if and (eq $.Page "service") (eq $.ActiveService .Service)}}active{{end}}" href="/services/{{.Service}}">
+              <span>{{.Name}}</span>
+              <span class="dot {{if .Reachable}}dot-ok{{else}}dot-warn{{end}}"></span>
+            </a>
+          {{else}}
+            <div class="nav-empty">No services discovered</div>
+          {{end}}
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="actor-email">{{.Principal.Email}}</div>
+        <div class="actor-meta">
+          <span class="pill">{{.Principal.AuthMethod}}</span>
+        </div>
+        <form method="post" action="/logout" class="logout-form">
+          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <button class="btn btn-sm" type="submit">Sign out</button>
+        </form>
+        {{if .CloudflareLogoutURL}}
+          <a class="cf-logout-link" href="{{.CloudflareLogoutURL}}">CF Access logout</a>
+        {{end}}
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="page-header">
+        <div>
+          <h1 id="page-heading">{{.PageTitle}}</h1>
+          <div id="page-subtitle" class="muted"></div>
+        </div>
+        <div id="header-status" class="header-status"></div>
+      </header>
+
+      <div id="toast" class="toast hidden" role="status"></div>
+
+      {{if eq .Page "overview"}}
+        <section id="overview-root">
+          <div id="hw-grid" class="grid-cards"></div>
+          <div id="gpu-section" class="panel hidden">
+            <div class="panel-header"><h2>NVIDIA GPU</h2><span id="gpu-driver" class="muted"></span></div>
+            <div id="gpu-body"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header"><h2>1-Hour Telemetry History</h2><span id="hist-meta" class="muted"></span></div>
+            <div id="charts-grid" class="charts-grid"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header"><h2>Compose Stack Containers</h2><span id="containers-meta" class="muted"></span></div>
+            <div class="table-wrap"><table class="table" id="containers-table"></table></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header"><h2>PostgreSQL Databases (Read-Only)</h2><span id="db-meta" class="muted"></span></div>
+            <div class="table-wrap"><table class="table" id="db-table"></table></div>
+          </div>
+        </section>
+      {{else if eq .Page "logs"}}
+        <section id="logs-root" class="panel">
+          <form id="log-filter-form" class="filter-grid">
+            <select id="log-service" name="service" aria-label="Service">
+              <option value="all">All containers</option>
+            </select>
+            <input id="log-query" name="q" type="text" placeholder="Search keyword or RE2 regex...">
+            <label class="check-inline"><input id="log-regex" type="checkbox"> Regex</label>
+            <select id="log-since" name="since" aria-label="Time window">
+              <option value="15m">Last 15m</option>
+              <option value="1h" selected>Last 1h</option>
+              <option value="6h">Last 6h</option>
+              <option value="24h">Last 24h</option>
+            </select>
+            <select id="log-level" name="level" aria-label="Level">
+              <option value="all">All levels</option>
+              <option value="error">Error</option>
+              <option value="warn">Warn</option>
+              <option value="info">Info</option>
+            </select>
+            <input id="log-nginx-host" name="nginx_host" type="text" placeholder="nginx host (optional)">
+            <select id="log-nginx-status" name="nginx_status" aria-label="HTTP Status">
+              <option value="">Any HTTP status</option>
+              <option value="2xx">2xx</option>
+              <option value="3xx">3xx</option>
+              <option value="4xx">4xx</option>
+              <option value="5xx">5xx</option>
+            </select>
+            <button class="btn btn-primary" type="submit">Search</button>
+            <button id="log-tail-btn" class="btn" type="button">Live Tail</button>
+            <button id="log-older-btn" class="btn hidden" type="button">Load Older</button>
+          </form>
+          <div id="log-meta" class="muted log-meta"></div>
+          <div id="log-output" class="log-console"></div>
+        </section>
+      {{else if eq .Page "service"}}
+        <section id="service-root">
+          <div id="service-banner" class="alert hidden"></div>
+          <div id="service-tabs" class="tabs"></div>
+          <div id="service-panel" class="panel"></div>
+        </section>
+      {{else if eq .Page "audit"}}
+        <section id="audit-root" class="panel">
+          <form id="audit-filter-form" class="filter-row">
+            <input id="audit-service" type="text" placeholder="Filter service (e.g. artifact)">
+            <input id="audit-action" type="text" placeholder="Filter action">
+            <button class="btn btn-primary" type="submit">Filter</button>
+          </form>
+          <div class="table-wrap"><table class="table" id="audit-table"></table></div>
+        </section>
+      {{end}}
+    </main>
+  </div>
+</body>
+</html>

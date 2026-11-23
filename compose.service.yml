@@ -1,0 +1,22 @@
+services:
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    env_file:
+      - path: .env
+        required: true
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "/admin", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s

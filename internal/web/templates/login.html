@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <title>Sign in · admin.cubus.sh</title>
+  <link rel="stylesheet" href="/static/admin.css">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="brand-lg">admin.cubus.sh</div>
+    <p class="muted">cubus.sh platform control plane &amp; observability console.</p>
+    {{if .Error}}<div class="alert">{{.Error}}</div>{{end}}
+    {{if .Notice}}<div class="alert alert-info">{{.Notice}}</div>{{end}}
+
+    {{if .GoogleEnabled}}
+      <a class="btn btn-primary btn-block" href="/auth/google/start?next={{.Next}}">Sign in with Google</a>
+    {{end}}
+
+    {{if .CloudflareOnly}}
+      <p class="muted">This console requires a valid Cloudflare Access identity header (<code>Cf-Access-Jwt-Assertion</code>).</p>
+    {{end}}
+
+    {{if .CloudflareLogoutURL}}
+      <p class="muted spacer-top">
+        Using Cloudflare Access? <a href="{{.CloudflareLogoutURL}}">End Cloudflare Access session</a>
+      </p>
+    {{end}}
+  </main>
+</body>
+</html>

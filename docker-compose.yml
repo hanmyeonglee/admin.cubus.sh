@@ -1,0 +1,32 @@
+services:
+  admin:
+    extends:
+      file: compose.service.yml
+      service: admin
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      PUBLIC_BASE_URL: "http://127.0.0.1:8000"
+      DATABASE_URL: "postgres://admin_dev:admin_dev@postgres:5432/admin_dev?sslmode=disable"
+      DEV_AUTH_EMAIL: "dev@localhost"
+      ADMIN_ALLOWED_EMAILS: "dev@localhost"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:18.7-alpine3.24
+    environment:
+      POSTGRES_USER: admin_dev
+      POSTGRES_PASSWORD: admin_dev
+      POSTGRES_DB: admin_dev
+    volumes:
+      - admin-dev-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "admin_dev", "-d", "admin_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  admin-dev-pgdata:
