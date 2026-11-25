@@ -23,7 +23,7 @@ import (
 	"cubus.sh/admin/internal/store"
 )
 
-//go:embed templates/*.html static/*
+//go:embed templates/*.html static
 var embeddedFS embed.FS
 
 const (
@@ -90,7 +90,7 @@ func New(
 		services:      services,
 		logger:        logger,
 		templates:     tmpl,
-		staticHandler: http.StripPrefix("/static/", http.FileServer(http.FS(staticSub))),
+		staticHandler: http.StripPrefix("/static/", http.FileServer(http.FS(noDirListingFS{fsys: staticSub}))),
 		csrfProtect:   csrf,
 		sseSem:        make(chan struct{}, maxConcurrentSSE),
 	}, nil
@@ -332,7 +332,7 @@ func (s *Server) handleLogsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleServicePage(w http.ResponseWriter, r *http.Request) {
-	name := strings.TrimSpace(r.PathValue("name"))
+	name := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
 	s.renderApp(w, r, "service", "Service · "+name, name)
 }
 
@@ -345,7 +345,7 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"services": s.services.ListServices(ctx),
 	}
-	if s.ops.Configured() {
+	if s.ops != nil && s.ops.Configured() {
 		if sys, err := s.ops.GetSystemRaw(ctx); err == nil {
 			resp["system"] = sys
 		} else {
@@ -357,7 +357,7 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 			resp["containers_error"] = err.Error()
 		}
 	}
-	if s.dbStats.Configured() {
+	if s.dbStats != nil && s.dbStats.Configured() {
 		if dbs, err := s.dbStats.GetRaw(ctx); err == nil {
 			resp["db_stats"] = dbs
 		} else {
@@ -368,7 +368,7 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStreamMetrics(w http.ResponseWriter, r *http.Request) {
-	if !s.ops.Configured() {
+	if s.ops == nil || !s.ops.Configured() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ops-agent not configured"})
 		return
 	}
@@ -440,6 +440,10 @@ func (s *Server) handleStreamMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPILogsSearch(w http.ResponseWriter, r *http.Request) {
+	if s.ops == nil || !s.ops.Configured() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ops-agent not configured"})
+		return
+	}
 	raw, status, err := s.ops.SearchLogsRaw(r.Context(), r.URL.Query())
 	if err != nil {
 		writeJSON(w, status, map[string]string{"error": err.Error()})
@@ -449,6 +453,10 @@ func (s *Server) handleAPILogsSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
+	if s.ops == nil || !s.ops.Configured() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ops-agent not configured"})
+		return
+	}
 	service := strings.TrimSpace(r.URL.Query().Get("service"))
 	if service == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "service is required"})
@@ -701,6 +709,27 @@ func (s *Server) renderTemplate(w http.ResponseWriter, status int, name string, 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = w.Write(buf.Bytes())
+}
+
+type noDirListingFS struct {
+	fsys fs.FS
+}
+
+func (f noDirListingFS) Open(name string) (fs.File, error) {
+	file, err := f.fsys.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if info.IsDir() {
+		_ = file.Close()
+		return nil, fs.ErrNotExist
+	}
+	return file, nil
 }
 
 func setSecurityHeaders(w http.ResponseWriter) {
