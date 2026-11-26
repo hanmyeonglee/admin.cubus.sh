@@ -9,7 +9,7 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/admin ./cmd/admin
+RUN CGO_ENABLED=0 GOOS=linux go build -tags no_fs_access -trimpath -ldflags="-s -w" -o /out/admin ./cmd/admin
 
 FROM scratch
 
