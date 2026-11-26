@@ -1,0 +1,29 @@
+title: PostgreSQL Authentication Failure and Dangerous Query Probe
+id: a1f04e10-8a7e-4b3c-9c12-100000000005
+status: stable
+description: Detects PostgreSQL authentication failures, pg_hba rejections, privilege denials, connection exhaustion, FATAL database events, and OS-command copy/file probes.
+author: cubus.sh
+date: 2026-11-26
+tags:
+    - attack.credential_access
+    - attack.execution
+    - attack.t1110
+level: high
+logsource:
+    category: database
+    service: postgres
+detection:
+    selection_msg:
+        message|contains:
+            - password authentication failed
+            - no pg_hba.conf entry
+            - permission denied for
+            - pg_read_file
+            - lo_import
+            - too many clients already
+            - 'FATAL:'
+    selection_copy_program:
+        message|re: (?i)\bCOPY\b[^\r\n]{0,160}\bPROGRAM\b
+    condition: 1 of selection_*
+falsepositives:
+    - Transient client disconnects or scheduled maintenance restarts

@@ -1,0 +1,40 @@
+title: Authentication, OAuth, CSRF, and Internal Admin Boundary Violations
+id: a1f04e10-8a7e-4b3c-9c12-100000000004
+status: stable
+description: Detects rejected authentication tokens, CSRF validation failures, OAuth state/identity mismatches, and unauthorized internal admin network access attempts.
+author: cubus.sh
+date: 2026-11-26
+tags:
+    - attack.initial_access
+    - attack.credential_access
+    - attack.t1078
+    - attack.t1110
+level: high
+logsource:
+    category: application
+    product: cubus
+detection:
+    selection_keywords:
+        message|contains:
+            - invalid CSRF token
+            - rejected unauthorized google login
+            - mismatched with cloudflare access
+            - missing or invalid admin bearer token
+            - peer outside allowed admin subnet
+            - Invalid or missing Bearer key
+            - OIDC state mismatch
+            - token verification failed
+    selection_oauth_state:
+        level:
+            - warn
+            - error
+        message|re: (?i)(?:oauth|oidc|auth|login|callback)[^\r\n]{0,60}invalid state|\binvalid state\s+(?:parameter|token|cookie|mismatch)\b
+    filter_log_search:
+        service: nginx-proxy
+        host: admin.cubus.sh
+        method: GET
+        status: '200'
+        uri|re: '^/api/logs/search(?:\?|$)'
+    condition: (selection_keywords or selection_oauth_state) and not filter_log_search
+falsepositives:
+    - Expired browser sessions after server restart or logout

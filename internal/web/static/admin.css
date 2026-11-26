@@ -1,167 +1,26 @@
-/* Supplemental layout and custom widget styles built on Tabler's --tblr-* tokens. */
+/* Minimal helpers supplementing @tabler/core */
 
-.tabular-nums {
-  font-variant-numeric: tabular-nums;
-}
-
-.min-w-0 {
-  min-width: 0;
-}
-
-.brand-mark {
-  width: 2rem;
-  height: 2rem;
-  flex-shrink: 0;
-}
-
-.icon-inline {
-  width: 1rem;
-  height: 1rem;
-  flex-shrink: 0;
-}
-
-.navbar-vertical .nav-link-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.navbar-vertical .nav-link-icon svg {
-  width: 1.15rem;
-  height: 1.15rem;
-}
-
-.navbar-vertical .navbar-footer {
-  margin-top: auto;
-}
-
-.sidebar-logout-link {
-  font-size: 0.75rem;
-}
-
-/* Confirmation modal & toast visibility without Bootstrap JS bundle */
-.modal.admin-modal.show {
-  display: block;
-}
-
-.modal-backdrop.admin-backdrop:not(.show) {
-  display: none;
-}
-
-.toast-container {
-  z-index: 1090;
-}
-
-.toast-status-dot {
-  width: 0.5rem;
-  height: 0.5rem;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
-/* Telemetry history charts */
-.chart-canvas-wrap {
+.chart-box {
   position: relative;
-  width: 100%;
-  height: 164px;
+  height: 220px;
 }
 
-.chart-canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
-  cursor: crosshair;
-  touch-action: none;
-}
-
-.chart-tooltip {
-  position: absolute;
-  top: 0.5rem;
-  left: 0.5rem;
-  z-index: 10;
-  pointer-events: none;
-  background-color: var(--tblr-bg-surface);
-  color: var(--tblr-body-color);
-  border: var(--tblr-border-width) var(--tblr-border-style) var(--tblr-border-color);
-  border-radius: var(--tblr-border-radius);
-  box-shadow: var(--tblr-box-shadow-sm);
-  padding: 0.35rem 0.6rem;
-  font-size: 0.75rem;
-  line-height: 1.35;
-  white-space: nowrap;
-}
-
-/* Log Explorer console */
-.log-console {
-  max-height: 68vh;
+.log-scroll {
+  max-height: 65vh;
   overflow: auto;
-  font-family: var(--tblr-font-monospace);
-  font-size: 0.8rem;
-  line-height: 1.5;
-  background-color: var(--tblr-bg-surface-tertiary);
 }
 
-.log-row {
-  display: grid;
-  grid-template-columns: 162px 110px 64px minmax(0, 1fr);
-  gap: 0.5rem;
-  align-items: baseline;
-  padding: 0.4rem 1rem;
-  border-bottom: var(--tblr-border-width) var(--tblr-border-style) var(--tblr-border-color);
-  word-break: break-word;
-}
-
-.log-row:last-child {
-  border-bottom: 0;
-}
-
-.log-row:hover {
-  background-color: var(--tblr-bg-surface);
-}
-
-@media (max-width: 767.98px) {
-  .log-row {
-    grid-template-columns: 1fr;
-    gap: 0.25rem;
-  }
-}
-
-.log-ts {
-  color: var(--tblr-secondary-color);
-  font-size: 0.75rem;
-  white-space: nowrap;
-}
-
-.log-msg-chips {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.35rem;
-}
-
-.log-req-text {
-  font-weight: 500;
-}
-
-/* Service settings & audit details */
-.service-settings-body {
-  max-width: 46rem;
-}
-
-.audit-details-pre {
-  margin: 0.35rem 0 0;
-  padding: 0.45rem 0.6rem;
-  border-radius: var(--tblr-border-radius);
-  border: var(--tblr-border-width) var(--tblr-border-style) var(--tblr-border-color);
-  background-color: var(--tblr-bg-surface-tertiary);
-  color: var(--tblr-body-color);
-  font-family: var(--tblr-font-monospace);
-  font-size: 0.75rem;
+.audit-json {
   white-space: pre-wrap;
   word-break: break-word;
   max-width: 28rem;
+  color: var(--tblr-body-color);
 }
 
-.col-image-cell {
+.col-image {
   max-width: 16rem;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }

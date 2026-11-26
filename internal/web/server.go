@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -13,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +24,7 @@ import (
 	"cubus.sh/admin/internal/auth"
 	"cubus.sh/admin/internal/clients"
 	"cubus.sh/admin/internal/config"
+	"cubus.sh/admin/internal/logclassify"
 	"cubus.sh/admin/internal/store"
 )
 
@@ -29,28 +34,64 @@ var embeddedFS embed.FS
 const (
 	adminCSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 
-	healthPingTimeout = 1500 * time.Millisecond
-	maxMutationBody   = 32 << 10
-	sseMaxLifetime    = 30 * time.Minute
-	sseMetricsTick    = 5 * time.Second
-	sseHeartbeat      = 15 * time.Second
-	sseWriteExtend    = 30 * time.Second
-	maxConcurrentSSE  = 8
+	healthPingTimeout     = 1500 * time.Millisecond
+	maxMutationBody       = 32 << 10
+	maxClassifyBody       = 512 << 10
+	maxClassifyEntries    = 200
+	classifierInfoTimeout = 3 * time.Second
+	amberClassifyTimeout  = 30 * time.Second
+	classifyWriteExtend   = 45 * time.Second
+	sseMaxLifetime        = 30 * time.Minute
+	sseMetricsTick        = 5 * time.Second
+	sseHeartbeat          = 15 * time.Second
+	sseWriteExtend        = 30 * time.Second
+	maxConcurrentSSE      = 8
+	maxConcurrentClassify = 4
 )
 
 type Server struct {
-	cfg      config.Config
-	store    store.Store
-	auth     *auth.Authenticator
-	ops      *clients.OpsClient
-	dbStats  *clients.DBStatsClient
-	services *clients.ServiceClient
-	logger   *slog.Logger
+	cfg        config.Config
+	store      store.Store
+	auth       *auth.Authenticator
+	ops        *clients.OpsClient
+	dbStats    *clients.DBStatsClient
+	services   *clients.ServiceClient
+	classifier *logclassify.Engine
+	logger     *slog.Logger
 
-	templates     *template.Template
-	staticHandler http.Handler
-	csrfProtect   *http.CrossOriginProtection
-	sseSem        chan struct{}
+	templates            *template.Template
+	staticHandler        http.Handler
+	assetVersion         string
+	csrfProtect          *http.CrossOriginProtection
+	sseSem               chan struct{}
+	classifySem          chan struct{}
+	sseHeartbeatOverride time.Duration
+}
+
+func computeStaticAssetVersion(staticFS fs.FS) (string, error) {
+	var paths []string
+	if err := fs.WalkDir(staticFS, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			paths = append(paths, path)
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	sort.Strings(paths)
+	h := sha256.New()
+	for _, p := range paths {
+		data, err := fs.ReadFile(staticFS, p)
+		if err != nil {
+			return "", err
+		}
+		_, _ = fmt.Fprintf(h, "%s\x00%d\x00", p, len(data))
+		_, _ = h.Write(data)
+	}
+	return hex.EncodeToString(h.Sum(nil)[:6]), nil
 }
 
 func New(
@@ -73,12 +114,21 @@ func New(
 	if err != nil {
 		return nil, fmt.Errorf("open static fs: %w", err)
 	}
+	assetVer, err := computeStaticAssetVersion(staticSub)
+	if err != nil {
+		return nil, fmt.Errorf("hash static assets: %w", err)
+	}
 
 	csrf := http.NewCrossOriginProtection()
 	if cfg.PublicBaseURL != "" {
 		if err := csrf.AddTrustedOrigin(cfg.PublicBaseURL); err != nil {
 			return nil, fmt.Errorf("trust public origin: %w", err)
 		}
+	}
+
+	classifier, err := logclassify.NewEngine()
+	if err != nil {
+		return nil, fmt.Errorf("initialize log classifier: %w", err)
 	}
 
 	return &Server{
@@ -88,12 +138,29 @@ func New(
 		ops:           ops,
 		dbStats:       dbStats,
 		services:      services,
+		classifier:    classifier,
 		logger:        logger,
 		templates:     tmpl,
 		staticHandler: http.StripPrefix("/static/", http.FileServer(http.FS(noDirListingFS{fsys: staticSub}))),
+		assetVersion:  assetVer,
 		csrfProtect:   csrf,
 		sseSem:        make(chan struct{}, maxConcurrentSSE),
+		classifySem:   make(chan struct{}, maxConcurrentClassify),
 	}, nil
+}
+
+func (s *Server) sseHeartbeatInterval() time.Duration {
+	if s.sseHeartbeatOverride > 0 {
+		return s.sseHeartbeatOverride
+	}
+	return sseHeartbeat
+}
+
+func (s *Server) recheckStreamAuth(ctx context.Context, r *http.Request) bool {
+	authCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_, _, err := s.auth.Authenticate(nil, r.WithContext(authCtx))
+	return err == nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -103,7 +170,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.Handle("GET /static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Cache-Control", "public, max-age=3600")
+		if v := r.URL.Query().Get("v"); s.assetVersion != "" && v == s.assetVersion {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
 		s.staticHandler.ServeHTTP(w, r)
 	}))
 
@@ -124,6 +195,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/stream/metrics", s.requireAuthAPI(http.HandlerFunc(s.handleStreamMetrics)))
 	mux.Handle("GET /api/logs/search", s.requireAuthAPI(http.HandlerFunc(s.handleAPILogsSearch)))
 	mux.Handle("GET /api/logs/stream", s.requireAuthAPI(http.HandlerFunc(s.handleStreamLogs)))
+	mux.Handle("GET /api/logs/classifier-info", s.requireAuthAPI(http.HandlerFunc(s.handleAPILogsClassifierInfo)))
 	mux.Handle("GET /api/services", s.requireAuthAPI(http.HandlerFunc(s.handleAPIServices)))
 	mux.Handle("GET /api/services/{name}/manifest", s.requireAuthAPI(http.HandlerFunc(s.handleServiceManifest)))
 	mux.Handle("GET /api/services/{name}/users", s.requireAuthAPI(http.HandlerFunc(s.handleServiceUsers)))
@@ -132,6 +204,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/audit", s.requireAuthAPI(http.HandlerFunc(s.handleAPIAudit)))
 
 	// Authenticated Mutating APIs (CrossOriginProtection + CSRF token + Audit Log)
+	mux.Handle("POST /api/logs/classify", s.requireAuthWrite(http.HandlerFunc(s.handleAPILogsClassify)))
 	mux.Handle("POST /api/services/{name}/users/{id}/approve", s.requireAuthWrite(http.HandlerFunc(s.handleServiceUserApprove)))
 	mux.Handle("POST /api/services/{name}/users/{id}/deny", s.requireAuthWrite(http.HandlerFunc(s.handleServiceUserDeny)))
 	mux.Handle("PATCH /api/services/{name}/settings", s.requireAuthWrite(http.HandlerFunc(s.handleServiceSettingsPatch)))
@@ -189,7 +262,7 @@ func (s *Server) requireAuthWrite(next http.Handler) http.Handler {
 		}
 
 		csrfVal := strings.TrimSpace(r.Header.Get("X-CSRF-Token"))
-		if csrfVal == "" && strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		if csrfVal == "" && r.URL.Path == "/logout" && strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
 			r.Body = http.MaxBytesReader(w, r.Body, maxMutationBody)
 			if err := r.ParseForm(); err == nil {
 				csrfVal = r.PostForm.Get("csrf_token")
@@ -223,6 +296,7 @@ type loginViewData struct {
 	Next                string
 	Error               string
 	Notice              string
+	AssetVersion        string
 }
 
 func (s *Server) renderLogin(w http.ResponseWriter, status int, nextPath, errMsg, notice string) {
@@ -234,6 +308,7 @@ func (s *Server) renderLogin(w http.ResponseWriter, status int, nextPath, errMsg
 		Next:                auth.SafeNextPath(nextPath),
 		Error:               errMsg,
 		Notice:              notice,
+		AssetVersion:        s.assetVersion,
 	})
 }
 
@@ -307,6 +382,7 @@ type appViewData struct {
 	CSRFToken           string
 	Services            []clients.ServiceSummary
 	CloudflareLogoutURL string
+	AssetVersion        string
 }
 
 func (s *Server) renderApp(w http.ResponseWriter, r *http.Request, page, title, activeSvc string) {
@@ -320,6 +396,7 @@ func (s *Server) renderApp(w http.ResponseWriter, r *http.Request, page, title, 
 		CSRFToken:           p.CSRFToken,
 		Services:            svcs,
 		CloudflareLogoutURL: s.auth.CloudflareLogoutURL(),
+		AssetVersion:        s.assetVersion,
 	})
 }
 
@@ -400,7 +477,7 @@ func (s *Server) handleStreamMetrics(w http.ResponseWriter, r *http.Request) {
 
 	tick := time.NewTicker(sseMetricsTick)
 	defer tick.Stop()
-	hb := time.NewTicker(sseHeartbeat)
+	hb := time.NewTicker(s.sseHeartbeatInterval())
 	defer hb.Stop()
 
 	for {
@@ -408,6 +485,9 @@ func (s *Server) handleStreamMetrics(w http.ResponseWriter, r *http.Request) {
 		case <-streamCtx.Done():
 			return
 		case <-hb.C:
+			if !s.recheckStreamAuth(streamCtx, r) {
+				return
+			}
 			_ = respCtrl.SetWriteDeadline(time.Now().Add(sseWriteExtend))
 			if _, err := w.Write([]byte(": ping\n\n")); err != nil {
 				return
@@ -450,6 +530,208 @@ func (s *Server) handleAPILogsSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleAPILogsClassifierInfo(w http.ResponseWriter, r *http.Request) {
+	amberStatus := clients.AmberClassifierStatus{
+		Available: false,
+		Model:     "amber-150m",
+		Error:     "service discovery not configured",
+	}
+	if s.services != nil {
+		probeCtx, cancel := context.WithTimeout(r.Context(), classifierInfoTimeout)
+		amberStatus = s.services.AmberStatus(probeCtx)
+		cancel()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rule_engine": s.classifier.Info(),
+		"amber":       amberStatus,
+	})
+}
+
+func (s *Server) handleAPILogsClassify(w http.ResponseWriter, r *http.Request) {
+	select {
+	case s.classifySem <- struct{}{}:
+		defer func() { <-s.classifySem }()
+	default:
+		w.Header().Set("Retry-After", "2")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "too many concurrent classification requests"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxClassifyBody)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "classification payload exceeds 512 KiB limit"})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	var req struct {
+		Mode    string                 `json:"mode"`
+		Entries []logclassify.LogEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed JSON"})
+		return
+	}
+	mode, err := logclassify.FormatClassificationMode(strings.ToLower(strings.TrimSpace(req.Mode)))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(req.Entries) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "entries must contain at least 1 log entry"})
+		return
+	}
+	if len(req.Entries) > maxClassifyEntries {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("entries exceeds maximum batch limit of %d", maxClassifyEntries)})
+		return
+	}
+
+	start := time.Now()
+	var ruleResults []logclassify.RuleResult
+	if mode == "rules" || mode == "both" {
+		var clsErr error
+		ruleResults, clsErr = s.classifier.ClassifyBatch(r.Context(), req.Entries)
+		if clsErr != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "classification canceled"})
+			return
+		}
+	}
+	if r.Context().Err() != nil {
+		return
+	}
+
+	amberModel := "amber-150m"
+	amberEvaluated := 0
+	amberErr := ""
+	var amberMap map[int]logclassify.AmberResult
+
+	if mode == "amber" || mode == "both" {
+		// Extend the HTTP server write deadline so cold GPU startup on choice does not time out.
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(classifyWriteExtend))
+
+		if s.services == nil {
+			amberErr = "service discovery not configured"
+			if mode == "amber" {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": amberErr})
+				return
+			}
+		} else {
+			probeCtx, cancelProbe := context.WithTimeout(r.Context(), classifierInfoTimeout)
+			status := s.services.AmberStatus(probeCtx)
+			cancelProbe()
+			if status.Model != "" {
+				amberModel = status.Model
+			}
+			if !status.Available {
+				amberErr = status.Error
+				if amberErr == "" {
+					amberErr = "amber classifier service unavailable"
+				}
+				if mode == "amber" {
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": amberErr})
+					return
+				}
+			} else {
+				selected := logclassify.SelectAmberIndices(req.Entries, ruleResults, logclassify.MaxAmberBatch)
+				payload, buildErr := logclassify.BuildAmberBatchRequest(req.Entries, selected)
+				if buildErr != nil {
+					amberErr = buildErr.Error()
+					if mode == "amber" {
+						writeJSON(w, http.StatusBadRequest, map[string]string{"error": amberErr})
+						return
+					}
+				} else {
+					raw, upStatus, callErr := s.services.ProxyWithTimeout(
+						r.Context(),
+						status.Service,
+						http.MethodPost,
+						"/admin/v1/classify/batch",
+						nil,
+						payload,
+						amberClassifyTimeout,
+					)
+					if callErr != nil || upStatus != http.StatusOK {
+						amberErr = extractUpstreamError(raw, upStatus, callErr)
+						if mode == "amber" {
+							writeJSON(w, http.StatusBadGateway, map[string]string{"error": amberErr})
+							return
+						}
+					} else {
+						parsedModel, parsedResults, parseErr := logclassify.ParseAmberBatchResponse(raw, selected)
+						if parseErr != nil {
+							amberErr = parseErr.Error()
+							if mode == "amber" {
+								writeJSON(w, http.StatusBadGateway, map[string]string{"error": amberErr})
+								return
+							}
+						} else {
+							if parsedModel != "" {
+								amberModel = parsedModel
+							}
+							amberMap = parsedResults
+							for _, res := range parsedResults {
+								if res.Evaluated {
+									amberEvaluated++
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	results := make([]logclassify.EntryClassification, len(req.Entries))
+	for i := range req.Entries {
+		ec := logclassify.EntryClassification{Index: i}
+		if ruleResults != nil {
+			rr := ruleResults[i]
+			ec.Rule = &rr
+		}
+		if ar, ok := amberMap[i]; ok {
+			arCopy := ar
+			ec.Amber = &arCopy
+		} else if (mode == "amber" || mode == "both") && amberErr == "" {
+			ec.Amber = &logclassify.AmberResult{Evaluated: false}
+		}
+		results[i] = ec
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"mode":            mode,
+		"duration_ms":     time.Since(start).Milliseconds(),
+		"rule_engine":     s.classifier.Info(),
+		"amber_model":     amberModel,
+		"amber_evaluated": amberEvaluated,
+		"amber_error":     amberErr,
+		"summary":         logclassify.BuildSummary(results),
+		"results":         results,
+	})
+}
+
+func extractUpstreamError(raw json.RawMessage, status int, err error) string {
+	if len(raw) > 0 {
+		var body struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(raw, &body) == nil && strings.TrimSpace(body.Error) != "" {
+			return strings.TrimSpace(body.Error)
+		}
+	}
+	if err != nil {
+		return err.Error()
+	}
+	return fmt.Sprintf("classifier returned HTTP %d", status)
 }
 
 func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
@@ -519,13 +801,16 @@ func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	hb := time.NewTicker(sseHeartbeat)
+	hb := time.NewTicker(s.sseHeartbeatInterval())
 	defer hb.Stop()
 	for {
 		select {
 		case <-streamCtx.Done():
 			return
 		case <-hb.C:
+			if !s.recheckStreamAuth(streamCtx, r) {
+				return
+			}
 			_ = respCtrl.SetWriteDeadline(time.Now().Add(sseWriteExtend))
 			if _, err := w.Write([]byte(": ping\n\n")); err != nil {
 				return

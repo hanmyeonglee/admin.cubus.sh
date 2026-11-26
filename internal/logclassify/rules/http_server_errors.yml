@@ -1,0 +1,26 @@
+title: HTTP 5xx Server and Upstream Gateway Errors
+id: a1f04e10-8a7e-4b3c-9c12-100000000007
+status: stable
+description: Detects HTTP 5xx server errors and reverse-proxy upstream gateway failures.
+author: cubus.sh
+date: 2026-11-26
+tags:
+    - attack.impact
+level: medium
+logsource:
+    category: webserver
+    product: nginx
+detection:
+    selection_status:
+        status|re: ^5\d\d$
+    selection_upstream:
+        message|re: (?i)\b(?:502 bad gateway|503 service unavailable|504 gateway time-?out|upstream prematurely closed|connect\(\) failed)\b
+    filter_log_search:
+        service: nginx-proxy
+        host: admin.cubus.sh
+        method: GET
+        status: '200'
+        uri|re: '^/api/logs/search(?:\?|$)'
+    condition: 1 of selection_* and not filter_log_search
+falsepositives:
+    - Brief rolling container restarts

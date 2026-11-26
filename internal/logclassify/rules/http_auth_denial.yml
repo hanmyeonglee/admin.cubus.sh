@@ -1,0 +1,53 @@
+title: HTTP 401 or 403 Denial on Sensitive Admin or Auth Routes
+id: a1f04e10-8a7e-4b3c-9c12-100000000008
+status: stable
+description: Detects HTTP 401/403 access denials on administrative, authentication, API, or MCP routes.
+author: cubus.sh
+date: 2026-11-26
+tags:
+    - attack.initial_access
+    - attack.credential_access
+    - attack.t1078
+level: medium
+logsource:
+    category: webserver
+    product: nginx
+detection:
+    selection_status:
+        status:
+            - '401'
+            - '403'
+    selection_route:
+        - uri|contains:
+              - /admin
+              - /auth
+              - /login
+              - /oauth
+              - /api/
+              - /ops/
+              - /db/
+              - /token
+              - /mcp
+        - request|contains:
+              - /admin
+              - /auth
+              - /login
+              - /oauth
+              - /api/
+              - /ops/
+              - /db/
+              - /token
+              - /mcp
+        - message|contains:
+              - /admin
+              - /auth
+              - /login
+              - /oauth
+              - /api/
+              - /ops/
+              - /db/
+              - /token
+              - /mcp
+    condition: selection_status and selection_route
+falsepositives:
+    - Unauthenticated browser polls after session expiry

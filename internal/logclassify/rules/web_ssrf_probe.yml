@@ -1,0 +1,25 @@
+title: SSRF and Disallowed Private Network Address Access Block
+id: a1f04e10-8a7e-4b3c-9c12-100000000009
+status: stable
+description: Detects blocked Server-Side Request Forgery (SSRF) or disallowed private/loopback network dial attempts in container logs.
+author: cubus.sh
+date: 2026-11-26
+tags:
+    - attack.initial_access
+    - attack.t1190
+level: high
+logsource:
+    category: application
+    product: cubus
+detection:
+    selection_ssrf:
+        message|re: (?i)(?:\bssrf\s+(?:blocked|attempt|detected|rejected|protection[^\r\n]*blocked)|private\s+(?:ip|address|network)\s+blocked|blocked\s+loopback|disallowed\s+private)
+    filter_log_search:
+        service: nginx-proxy
+        host: admin.cubus.sh
+        method: GET
+        status: '200'
+        uri|re: '^/api/logs/search(?:\?|$)'
+    condition: selection_ssrf and not filter_log_search
+falsepositives:
+    - Internal configuration misdirection tests

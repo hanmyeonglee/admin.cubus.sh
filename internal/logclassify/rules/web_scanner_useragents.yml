@@ -1,0 +1,39 @@
+title: Automated Vulnerability Scanner and Brute-Force Tool User-Agent
+id: a1f04e10-8a7e-4b3c-9c12-100000000003
+status: stable
+description: Detects known automated security scanning, fuzzing, and directory brute-forcing tools in HTTP User-Agent headers or log lines.
+author: cubus.sh
+date: 2026-11-26
+tags:
+    - attack.reconnaissance
+    - attack.t1595.002
+level: high
+logsource:
+    category: webserver
+    product: nginx
+detection:
+    selection_ua:
+        user_agent|contains:
+            - sqlmap
+            - nikto
+            - nuclei
+            - masscan
+            - zgrab
+            - gobuster
+            - ffuf
+            - dirbuster
+            - acunetix
+            - nessus
+            - wpscan
+            - hydra
+    selection_msg:
+        message|re: (?i)\b(?:sqlmap|nikto|masscan|zgrab|gobuster|ffuf|dirbuster|acunetix|nessus|wpscan)\b
+    filter_log_search:
+        service: nginx-proxy
+        host: admin.cubus.sh
+        method: GET
+        status: '200'
+        uri|re: '^/api/logs/search(?:\?|$)'
+    condition: selection_ua or (selection_msg and not filter_log_search)
+falsepositives:
+    - Authorized penetration testing tools

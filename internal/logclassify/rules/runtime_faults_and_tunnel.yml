@@ -1,0 +1,36 @@
+title: Container Runtime Crash, GPU OOM, or Cloudflared Tunnel Failure
+id: a1f04e10-8a7e-4b3c-9c12-100000000006
+status: stable
+description: Detects critical container runtime faults (CUDA OOM, OOMKilled, Go panics, Python tracebacks) and cloudflared tunnel/origin failures.
+author: cubus.sh
+date: 2026-11-26
+tags:
+    - attack.impact
+    - attack.t1499
+level: high
+logsource:
+    category: application
+    product: cubus
+detection:
+    selection_runtime:
+        message|contains:
+            - CUDA out of memory
+            - OOMKilled
+            - 'panic:'
+            - 'fatal error:'
+            - Traceback (most recent call last)
+    selection_cloudflared_msg:
+        service: cloudflared
+        message|re: (?i)(?:\bERR\b|unable to reach the origin|origin[^\r\n]*(?:error|failed|refused|timeout)|tunnel[^\r\n]*(?:error|failed|disconnected))
+    selection_cloudflared_err:
+        service: cloudflared
+        level: error
+    filter_log_search:
+        service: nginx-proxy
+        host: admin.cubus.sh
+        method: GET
+        status: '200'
+        uri|re: '^/api/logs/search(?:\?|$)'
+    condition: 1 of selection_* and not filter_log_search
+falsepositives:
+    - Planned service restarts during deployments

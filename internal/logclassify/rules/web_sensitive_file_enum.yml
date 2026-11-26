@@ -1,0 +1,53 @@
+title: Sensitive Web Path and Configuration Enumeration
+id: a1f04e10-8a7e-4b3c-9c12-100000000001
+status: stable
+description: Detects reconnaissance requests probing for exposed environment files, VCS metadata, CMS admin panels, debug endpoints, or cloud credential files.
+author: cubus.sh
+date: 2026-11-26
+tags:
+    - attack.discovery
+    - attack.t1595
+    - attack.t1083
+level: medium
+logsource:
+    category: webserver
+    product: nginx
+detection:
+    selection_uri:
+        uri|contains:
+            - /.env
+            - /.git/
+            - wp-login.php
+            - wp-config
+            - phpmyadmin
+            - xmlrpc.php
+            - /.aws/
+            - /.ssh/
+            - phpinfo
+            - /actuator
+            - /cgi-bin/
+    selection_uri_re:
+        uri|re: (?i)(?:^|[/?&=])(?:\.git|\.env)(?:[/?#&\s]|$)
+    selection_msg:
+        message|contains:
+            - /.env
+            - /.git/
+            - /.git/config
+            - wp-login.php
+            - wp-config
+            - phpmyadmin
+            - xmlrpc.php
+            - /.aws/
+            - /.ssh/
+            - phpinfo
+            - /actuator
+            - /cgi-bin/
+    filter_log_search:
+        service: nginx-proxy
+        host: admin.cubus.sh
+        method: GET
+        status: '200'
+        uri|re: '^/api/logs/search(?:\?|$)'
+    condition: 1 of selection_* and not filter_log_search
+falsepositives:
+    - Authorized external security audits
