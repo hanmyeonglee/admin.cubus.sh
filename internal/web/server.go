@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"cubus.sh/admin/internal/auth"
 	"cubus.sh/admin/internal/clients"
@@ -186,12 +188,14 @@ func (s *Server) Handler() http.Handler {
 
 	// Authenticated SSR pages
 	mux.Handle("GET /{$}", s.requireAuthPage(http.HandlerFunc(s.handleOverviewPage)))
+	mux.Handle("GET /access", s.requireAuthPage(http.HandlerFunc(s.handleAccessPage)))
 	mux.Handle("GET /logs", s.requireAuthPage(http.HandlerFunc(s.handleLogsPage)))
 	mux.Handle("GET /services/{name}", s.requireAuthPage(http.HandlerFunc(s.handleServicePage)))
 	mux.Handle("GET /audit", s.requireAuthPage(http.HandlerFunc(s.handleAuditPage)))
 
 	// Authenticated Read APIs & SSE
 	mux.Handle("GET /api/overview", s.requireAuthAPI(http.HandlerFunc(s.handleAPIOverview)))
+	mux.Handle("GET /api/access/overview", s.requireAuthAPI(http.HandlerFunc(s.handleAPIAccessOverview)))
 	mux.Handle("GET /api/stream/metrics", s.requireAuthAPI(http.HandlerFunc(s.handleStreamMetrics)))
 	mux.Handle("GET /api/logs/search", s.requireAuthAPI(http.HandlerFunc(s.handleAPILogsSearch)))
 	mux.Handle("GET /api/logs/stream", s.requireAuthAPI(http.HandlerFunc(s.handleStreamLogs)))
@@ -199,6 +203,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/services", s.requireAuthAPI(http.HandlerFunc(s.handleAPIServices)))
 	mux.Handle("GET /api/services/{name}/manifest", s.requireAuthAPI(http.HandlerFunc(s.handleServiceManifest)))
 	mux.Handle("GET /api/services/{name}/users", s.requireAuthAPI(http.HandlerFunc(s.handleServiceUsers)))
+	mux.Handle("GET /api/services/{name}/invites", s.requireAuthAPI(http.HandlerFunc(s.handleServiceInvitesList)))
+	mux.Handle("GET /api/services/{name}/api-keys", s.requireAuthAPI(http.HandlerFunc(s.handleServiceAPIKeysList)))
 	mux.Handle("GET /api/services/{name}/settings", s.requireAuthAPI(http.HandlerFunc(s.handleServiceSettingsGet)))
 	mux.Handle("GET /api/services/{name}/artifacts", s.requireAuthAPI(http.HandlerFunc(s.handleServiceArtifactsList)))
 	mux.Handle("GET /api/audit", s.requireAuthAPI(http.HandlerFunc(s.handleAPIAudit)))
@@ -207,6 +213,14 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/logs/classify", s.requireAuthWrite(http.HandlerFunc(s.handleAPILogsClassify)))
 	mux.Handle("POST /api/services/{name}/users/{id}/approve", s.requireAuthWrite(http.HandlerFunc(s.handleServiceUserApprove)))
 	mux.Handle("POST /api/services/{name}/users/{id}/deny", s.requireAuthWrite(http.HandlerFunc(s.handleServiceUserDeny)))
+	mux.Handle("PATCH /api/services/{name}/users/{id}", s.requireAuthWrite(http.HandlerFunc(s.handleServiceUserPatch)))
+	mux.Handle("DELETE /api/services/{name}/users/{id}", s.requireAuthWrite(http.HandlerFunc(s.handleServiceUserDelete)))
+	mux.Handle("DELETE /api/services/{name}/users/{id}/sessions", s.requireAuthWrite(http.HandlerFunc(s.handleServiceUserSessionsDelete)))
+	mux.Handle("POST /api/services/{name}/invites", s.requireAuthWrite(http.HandlerFunc(s.handleServiceInviteCreate)))
+	mux.Handle("DELETE /api/services/{name}/invites/{id}", s.requireAuthWrite(http.HandlerFunc(s.handleServiceInviteDelete)))
+	mux.Handle("POST /api/services/{name}/api-keys", s.requireAuthWrite(http.HandlerFunc(s.handleServiceAPIKeyCreate)))
+	mux.Handle("POST /api/services/{name}/api-keys/{id}/revoke", s.requireAuthWrite(http.HandlerFunc(s.handleServiceAPIKeyRevoke)))
+	mux.Handle("DELETE /api/services/{name}/api-keys/{id}", s.requireAuthWrite(http.HandlerFunc(s.handleServiceAPIKeyDelete)))
 	mux.Handle("PATCH /api/services/{name}/settings", s.requireAuthWrite(http.HandlerFunc(s.handleServiceSettingsPatch)))
 	mux.Handle("DELETE /api/services/{name}/artifacts/{id}", s.requireAuthWrite(http.HandlerFunc(s.handleServiceArtifactDelete)))
 
@@ -402,6 +416,10 @@ func (s *Server) renderApp(w http.ResponseWriter, r *http.Request, page, title, 
 
 func (s *Server) handleOverviewPage(w http.ResponseWriter, r *http.Request) {
 	s.renderApp(w, r, "overview", "Overview & Hardware", "")
+}
+
+func (s *Server) handleAccessPage(w http.ResponseWriter, r *http.Request) {
+	s.renderApp(w, r, "access", "Users & Access", "")
 }
 
 func (s *Server) handleLogsPage(w http.ResponseWriter, r *http.Request) {
@@ -833,12 +851,55 @@ func (s *Server) handleAPIServices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"services": s.services.ListServices(r.Context())})
 }
 
+func (s *Server) handleAPIAccessOverview(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, s.services.FetchAccessOverview(r.Context()))
+}
+
 func (s *Server) handleServiceManifest(w http.ResponseWriter, r *http.Request) {
 	s.proxyServiceRead(w, r, "/admin/v1/manifest", nil)
 }
 
 func (s *Server) handleServiceUsers(w http.ResponseWriter, r *http.Request) {
-	s.proxyServiceRead(w, r, "/admin/v1/users", r.URL.Query())
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	raw, status, err := s.services.ListUsers(r.Context(), svc, r.URL.Query())
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleServiceInvitesList(w http.ResponseWriter, r *http.Request) {
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	raw, status, err := s.services.ListInvites(r.Context(), svc)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleServiceAPIKeysList(w http.ResponseWriter, r *http.Request) {
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	raw, status, err := s.services.ListAPIKeys(r.Context(), svc)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeRawJSON(w, status, raw)
 }
 
 func (s *Server) handleServiceSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -850,13 +911,76 @@ func (s *Server) handleServiceArtifactsList(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) proxyServiceRead(w http.ResponseWriter, r *http.Request, relPath string, q url.Values) {
-	svc := r.PathValue("name")
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
 	raw, status, err := s.services.Proxy(r.Context(), svc, http.MethodGet, relPath, q, nil)
 	if err != nil {
 		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	writeRawJSON(w, status, raw)
+}
+
+func decodeStrictJSONObject(w http.ResponseWriter, r *http.Request, dst any) (int, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxMutationBody)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return http.StatusRequestEntityTooLarge, errors.New("request body too large")
+		}
+		return http.StatusBadRequest, errors.New("invalid request body")
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return http.StatusBadRequest, errors.New("request body must be a JSON object")
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return http.StatusBadRequest, errors.New("malformed JSON")
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return http.StatusBadRequest, errors.New("trailing JSON tokens in request body")
+	}
+	return 0, nil
+}
+
+func containsControlChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || unicode.Is(unicode.Cc, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeOperatorCreatedBy(email string, maxRunes int) string {
+	var b strings.Builder
+	count := 0
+	for _, r := range strings.TrimSpace(email) {
+		if r < 0x20 || r == 0x7f || unicode.Is(unicode.Cc, r) {
+			continue
+		}
+		if count >= maxRunes {
+			break
+		}
+		b.WriteRune(r)
+		count++
+	}
+	return b.String()
+}
+
+func marshalAuditDetails(v any) json.RawMessage {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return json.RawMessage(data)
 }
 
 func (s *Server) handleServiceUserApprove(w http.ResponseWriter, r *http.Request) {
@@ -868,13 +992,25 @@ func (s *Server) handleServiceUserDeny(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleServiceUserDecision(w http.ResponseWriter, r *http.Request, action string) {
-	svc := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
 	id, err := clients.ValidateResourceID(r.PathValue("id"))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid user id"})
 		return
 	}
-	raw, status, err := s.services.Proxy(r.Context(), svc, http.MethodPost, "/admin/v1/users/"+url.PathEscape(id)+"/"+action, nil, nil)
+	var (
+		raw    json.RawMessage
+		status int
+	)
+	if action == "approve" {
+		raw, status, err = s.services.ApproveUser(r.Context(), svc, id)
+	} else {
+		raw, status, err = s.services.DenyUser(r.Context(), svc, id)
+	}
 	if err != nil {
 		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
@@ -886,8 +1022,379 @@ func (s *Server) handleServiceUserDecision(w http.ResponseWriter, r *http.Reques
 	writeRawJSON(w, status, raw)
 }
 
+func (s *Server) handleServiceUserPatch(w http.ResponseWriter, r *http.Request) {
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	id, err := clients.ValidateResourceID(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+		return
+	}
+	var req struct {
+		Status string `json:"status"`
+	}
+	if code, err := decodeStrictJSONObject(w, r, &req); err != nil {
+		writeJSON(w, code, map[string]string{"error": err.Error()})
+		return
+	}
+	nextStatus := strings.TrimSpace(req.Status)
+	if nextStatus != "active" && nextStatus != "disabled" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status must be active or disabled"})
+		return
+	}
+	forwardBody, err := json.Marshal(map[string]string{"status": nextStatus})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode request"})
+		return
+	}
+	raw, status, err := s.services.UpdateUserStatus(r.Context(), svc, id, forwardBody)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if status >= 200 && status < 300 {
+		p, _ := auth.PrincipalFromContext(r.Context())
+		s.recordAudit(r.Context(), p, r, "user.status_update", svc, id, marshalAuditDetails(map[string]any{
+			"status": nextStatus,
+		}))
+	}
+	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleServiceUserDelete(w http.ResponseWriter, r *http.Request) {
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	id, err := clients.ValidateResourceID(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+		return
+	}
+	raw, status, err := s.services.DeleteUser(r.Context(), svc, id)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if status >= 200 && status < 300 {
+		p, _ := auth.PrincipalFromContext(r.Context())
+		s.recordAudit(r.Context(), p, r, "user.delete", svc, id, nil)
+	}
+	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleServiceUserSessionsDelete(w http.ResponseWriter, r *http.Request) {
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	id, err := clients.ValidateResourceID(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+		return
+	}
+	raw, status, err := s.services.RevokeUserSessions(r.Context(), svc, id)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if status >= 200 && status < 300 {
+		p, _ := auth.PrincipalFromContext(r.Context())
+		var details json.RawMessage
+		var respMeta struct {
+			Revoked *int64 `json:"revoked"`
+		}
+		if json.Unmarshal(raw, &respMeta) == nil && respMeta.Revoked != nil {
+			details = marshalAuditDetails(map[string]any{"revoked": *respMeta.Revoked})
+		}
+		s.recordAudit(r.Context(), p, r, "user.sessions_revoke", svc, id, details)
+	}
+	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleServiceInviteCreate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	var req struct {
+		DisplayName string `json:"display_name"`
+		TTLHours    *int   `json:"ttl_hours"`
+		CreatedBy   string `json:"created_by"`
+	}
+	if code, err := decodeStrictJSONObject(w, r, &req); err != nil {
+		writeJSON(w, code, map[string]string{"error": err.Error()})
+		return
+	}
+	displayName := strings.TrimSpace(req.DisplayName)
+	if displayName == "" || utf8.RuneCountInString(displayName) > 64 || containsControlChar(displayName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "display_name must be 1..64 printable characters"})
+		return
+	}
+	if req.TTLHours != nil && (*req.TTLHours < 1 || *req.TTLHours > 720) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ttl_hours must be between 1 and 720"})
+		return
+	}
+
+	p, _ := auth.PrincipalFromContext(r.Context())
+	// Always inject created_by from the authenticated operator email (never trust client input).
+	createdBy := sanitizeOperatorCreatedBy(p.Email, 64)
+
+	forwardPayload := struct {
+		DisplayName string `json:"display_name"`
+		TTLHours    *int   `json:"ttl_hours,omitempty"`
+		CreatedBy   string `json:"created_by"`
+	}{
+		DisplayName: displayName,
+		TTLHours:    req.TTLHours,
+		CreatedBy:   createdBy,
+	}
+	forwardBody, err := json.Marshal(forwardPayload)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode request"})
+		return
+	}
+
+	raw, status, err := s.services.CreateInvite(r.Context(), svc, forwardBody)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if status >= 200 && status < 300 {
+		// SECURITY: Parse ONLY non-secret metadata for audit_logs; never log invite_url or raw token.
+		var meta struct {
+			Invite struct {
+				ID          string `json:"id"`
+				DisplayName string `json:"display_name"`
+				Status      string `json:"status"`
+			} `json:"invite"`
+		}
+		_ = json.Unmarshal(raw, &meta)
+		auditMeta := map[string]any{
+			"display_name": displayName,
+		}
+		if meta.Invite.DisplayName != "" {
+			auditMeta["display_name"] = meta.Invite.DisplayName
+		}
+		if req.TTLHours != nil {
+			auditMeta["ttl_hours"] = *req.TTLHours
+		}
+		if meta.Invite.Status != "" {
+			auditMeta["status"] = meta.Invite.Status
+		}
+		s.recordAudit(r.Context(), p, r, "invite.create", svc, meta.Invite.ID, marshalAuditDetails(auditMeta))
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleServiceInviteDelete(w http.ResponseWriter, r *http.Request) {
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	id, err := clients.ValidateResourceID(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid invite id"})
+		return
+	}
+	raw, status, err := s.services.DeleteInvite(r.Context(), svc, id)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if status >= 200 && status < 300 {
+		p, _ := auth.PrincipalFromContext(r.Context())
+		s.recordAudit(r.Context(), p, r, "invite.delete", svc, id, nil)
+	}
+	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleServiceAPIKeyCreate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	var req struct {
+		Name          string `json:"name"`
+		Owner         string `json:"owner"`
+		ExpiresInDays *int   `json:"expires_in_days"`
+		CreatedBy     string `json:"created_by"`
+	}
+	if code, err := decodeStrictJSONObject(w, r, &req); err != nil {
+		writeJSON(w, code, map[string]string{"error": err.Error()})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" || utf8.RuneCountInString(name) > 120 || containsControlChar(name) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must be 1..120 printable characters"})
+		return
+	}
+	owner := strings.TrimSpace(req.Owner)
+	if utf8.RuneCountInString(owner) > 120 || containsControlChar(owner) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner must be at most 120 printable characters"})
+		return
+	}
+	if req.ExpiresInDays != nil {
+		switch *req.ExpiresInDays {
+		case 30, 90, 365:
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expires_in_days must be one of 30, 90, 365, or null"})
+			return
+		}
+	}
+
+	p, _ := auth.PrincipalFromContext(r.Context())
+	// Always inject created_by from the authenticated operator email (never trust client input).
+	createdBy := sanitizeOperatorCreatedBy(p.Email, 120)
+
+	forwardPayload := struct {
+		Name          string `json:"name"`
+		Owner         string `json:"owner"`
+		ExpiresInDays *int   `json:"expires_in_days,omitempty"`
+		CreatedBy     string `json:"created_by"`
+	}{
+		Name:          name,
+		Owner:         owner,
+		ExpiresInDays: req.ExpiresInDays,
+		CreatedBy:     createdBy,
+	}
+	forwardBody, err := json.Marshal(forwardPayload)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode request"})
+		return
+	}
+
+	raw, status, err := s.services.CreateAPIKey(r.Context(), svc, forwardBody)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if status >= 200 && status < 300 {
+		// SECURITY: Parse ONLY non-secret metadata for audit_logs; never log plaintext api_key.
+		var meta struct {
+			Record struct {
+				ID        string `json:"id"`
+				Name      string `json:"name"`
+				Owner     string `json:"owner"`
+				KeyPrefix string `json:"key_prefix"`
+				Status    string `json:"status"`
+			} `json:"record"`
+		}
+		_ = json.Unmarshal(raw, &meta)
+		auditMeta := map[string]any{
+			"name": name,
+		}
+		if meta.Record.Name != "" {
+			auditMeta["name"] = meta.Record.Name
+		}
+		if meta.Record.Owner != "" {
+			auditMeta["owner"] = meta.Record.Owner
+		} else if owner != "" {
+			auditMeta["owner"] = owner
+		}
+		if meta.Record.KeyPrefix != "" {
+			auditMeta["key_prefix"] = meta.Record.KeyPrefix
+		}
+		if meta.Record.Status != "" {
+			auditMeta["status"] = meta.Record.Status
+		}
+		if req.ExpiresInDays != nil {
+			auditMeta["expires_in_days"] = *req.ExpiresInDays
+		}
+		s.recordAudit(r.Context(), p, r, "api_key.create", svc, meta.Record.ID, marshalAuditDetails(auditMeta))
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleServiceAPIKeyRevoke(w http.ResponseWriter, r *http.Request) {
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	id, err := clients.ValidateResourceID(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid api key id"})
+		return
+	}
+	raw, status, err := s.services.RevokeAPIKey(r.Context(), svc, id)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if status >= 200 && status < 300 {
+		p, _ := auth.PrincipalFromContext(r.Context())
+		var meta struct {
+			Name      string `json:"name"`
+			Owner     string `json:"owner"`
+			KeyPrefix string `json:"key_prefix"`
+			Status    string `json:"status"`
+		}
+		var details json.RawMessage
+		if json.Unmarshal(raw, &meta) == nil {
+			auditMeta := map[string]any{}
+			if meta.Name != "" {
+				auditMeta["name"] = meta.Name
+			}
+			if meta.Owner != "" {
+				auditMeta["owner"] = meta.Owner
+			}
+			if meta.KeyPrefix != "" {
+				auditMeta["key_prefix"] = meta.KeyPrefix
+			}
+			if meta.Status != "" {
+				auditMeta["status"] = meta.Status
+			}
+			if len(auditMeta) > 0 {
+				details = marshalAuditDetails(auditMeta)
+			}
+		}
+		s.recordAudit(r.Context(), p, r, "api_key.revoke", svc, id, details)
+	}
+	writeRawJSON(w, status, raw)
+}
+
+func (s *Server) handleServiceAPIKeyDelete(w http.ResponseWriter, r *http.Request) {
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
+	id, err := clients.ValidateResourceID(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid api key id"})
+		return
+	}
+	raw, status, err := s.services.DeleteAPIKey(r.Context(), svc, id)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if status >= 200 && status < 300 {
+		p, _ := auth.PrincipalFromContext(r.Context())
+		s.recordAudit(r.Context(), p, r, "api_key.delete", svc, id, nil)
+	}
+	writeRawJSON(w, status, raw)
+}
+
 func (s *Server) handleServiceSettingsPatch(w http.ResponseWriter, r *http.Request) {
-	svc := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxMutationBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -911,7 +1418,11 @@ func (s *Server) handleServiceSettingsPatch(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleServiceArtifactDelete(w http.ResponseWriter, r *http.Request) {
-	svc := strings.ToLower(strings.TrimSpace(r.PathValue("name")))
+	svc, err := clients.ValidateServiceName(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid service name"})
+		return
+	}
 	id, err := clients.ValidateResourceID(r.PathValue("id"))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid artifact id"})

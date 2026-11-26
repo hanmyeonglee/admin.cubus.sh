@@ -248,6 +248,122 @@
     });
   }
 
+  let secretModalCleanup = null;
+
+  function showOneTimeSecretModal(opts) {
+    const bs = getBS();
+    const modalEl = document.getElementById("secret-modal");
+    const titleEl = document.getElementById("secret-modal-title");
+    const warnEl = document.getElementById("secret-modal-warning");
+    const labelEl = document.getElementById("secret-modal-label");
+    const inputEl = document.getElementById("secret-modal-input");
+    const copyBtn = document.getElementById("secret-modal-copy");
+    const metaEl = document.getElementById("secret-modal-meta");
+
+    const secretVal = String((opts && opts.secret) || "");
+    if (!modalEl || !inputEl || !copyBtn) {
+      if (secretVal && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(secretVal).catch(() => {});
+      }
+      showToast((opts && opts.title) || "Secret created", false);
+      return;
+    }
+
+    if (typeof secretModalCleanup === "function") {
+      secretModalCleanup();
+      secretModalCleanup = null;
+    }
+
+    if (titleEl) titleEl.textContent = (opts && opts.title) || "One-Time Secret";
+    if (warnEl) {
+      warnEl.textContent = (opts && opts.warning) || "Copy this secret now. For security reasons, it will not be shown again after you close this dialog.";
+    }
+    if (labelEl) labelEl.textContent = (opts && opts.label) || "Secret";
+    inputEl.value = secretVal;
+    if (metaEl) metaEl.textContent = (opts && opts.meta) || "";
+    copyBtn.textContent = "Copy";
+    copyBtn.disabled = false;
+
+    let copyResetTimer = null;
+
+    async function onCopyClick() {
+      const val = inputEl.value;
+      if (!val) return;
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          await navigator.clipboard.writeText(val);
+        } else {
+          inputEl.focus();
+          inputEl.select();
+          const copied = document.execCommand("copy");
+          if (!copied) throw new Error("copy command failed");
+        }
+        copyBtn.textContent = "Copied";
+        showToast("Copied to clipboard");
+        if (copyResetTimer) clearTimeout(copyResetTimer);
+        copyResetTimer = setTimeout(() => {
+          copyResetTimer = null;
+          copyBtn.textContent = "Copy";
+        }, 2000);
+      } catch {
+        inputEl.focus();
+        inputEl.select();
+        showToast("Press Ctrl+C / Cmd+C to copy", true);
+      }
+    }
+
+    function onFallbackDismissClick(e) {
+      if (e.target === modalEl || (e.target && e.target.closest && e.target.closest('[data-bs-dismiss="modal"]'))) {
+        modalEl.classList.remove("show");
+        cleanupSecretState();
+      }
+    }
+
+    function onFallbackEscKey(e) {
+      if (e.key === "Escape") {
+        modalEl.classList.remove("show");
+        cleanupSecretState();
+      }
+    }
+
+    function onPageHide() {
+      cleanupSecretState();
+    }
+
+    function cleanupSecretState() {
+      if (copyResetTimer) {
+        clearTimeout(copyResetTimer);
+        copyResetTimer = null;
+      }
+      inputEl.value = "";
+      if (metaEl) metaEl.textContent = "";
+      copyBtn.textContent = "Copy";
+      copyBtn.removeEventListener("click", onCopyClick);
+      modalEl.removeEventListener("hidden.bs.modal", onHidden);
+      modalEl.removeEventListener("click", onFallbackDismissClick);
+      document.removeEventListener("keydown", onFallbackEscKey);
+      window.removeEventListener("pagehide", onPageHide);
+      secretModalCleanup = null;
+    }
+
+    function onHidden() {
+      cleanupSecretState();
+    }
+
+    secretModalCleanup = cleanupSecretState;
+    copyBtn.addEventListener("click", onCopyClick);
+    window.addEventListener("pagehide", onPageHide, { once: true });
+
+    if (bs && bs.Modal) {
+      modalEl.addEventListener("hidden.bs.modal", onHidden, { once: true });
+      bs.Modal.getOrCreateInstance(modalEl).show();
+    } else {
+      modalEl.addEventListener("click", onFallbackDismissClick);
+      document.addEventListener("keydown", onFallbackEscKey);
+      modalEl.classList.add("show");
+    }
+  }
+
   // ==================== FORMATTERS & API ====================
   function fmtBytes(n) {
     if (n === undefined || n === null || Number.isNaN(Number(n))) return "—";
@@ -2039,6 +2155,1003 @@
     runSearch(false);
   }
 
+  // ==================== SHARED ACCESS CONTROL HELPERS ====================
+  function resolveUserCapabilities(spec) {
+    if (spec && spec.user_capabilities && typeof spec.user_capabilities === "object") {
+      return spec.user_capabilities;
+    }
+    // Backward-compatible fallback for legacy manifests (e.g. artifact) without user_capabilities.
+    return { approve: true, deny: true };
+  }
+
+  function resolveUserColumns(spec) {
+    if (spec && Array.isArray(spec.user_columns)) {
+      return spec.user_columns;
+    }
+    if (spec && spec.user_capabilities && typeof spec.user_capabilities === "object") {
+      // Modern manifest with explicit user_capabilities and no extra columns.
+      return [];
+    }
+    // Backward-compatible fallback for legacy manifests (e.g. artifact) without user_capabilities or user_columns.
+    return [
+      { key: "role", label: "Role", format: "badge" },
+      { key: "artifact_count", label: "Artifacts", format: "number" },
+      { key: "storage_bytes", label: "Storage", format: "bytes" }
+    ];
+  }
+
+  function accessStatusBadgeClass(status) {
+    switch (String(status || "").toLowerCase()) {
+      case "active":
+      case "used":
+        return "badge bg-green-lt";
+      case "pending":
+        return "badge bg-yellow-lt";
+      case "disabled":
+      case "denied":
+      case "revoked":
+        return "badge bg-red-lt";
+      case "expired":
+      default:
+        return "badge bg-secondary-lt";
+    }
+  }
+
+  function formatCapLabel(cap) {
+    switch (String(cap || "")) {
+      case "users": return "Users";
+      case "invites": return "Invites";
+      case "api_keys": return "API Keys";
+      case "settings": return "Settings";
+      case "artifacts": return "Artifacts";
+      case "classify": return "Classify";
+      default: return String(cap || "").replace(/_/g, " ").toUpperCase();
+    }
+  }
+
+  function userPrincipalLabel(u) {
+    return (u && (u.display_name || u.username || u.id)) || "—";
+  }
+
+  function formatUserColumnCell(u, col) {
+    const val = u ? u[col.key] : undefined;
+    const fmt = String(col.format || "").toLowerCase();
+    if (fmt === "badge") {
+      const td = el("td");
+      td.appendChild(el("span", "badge bg-secondary-lt", val || "user"));
+      return td;
+    }
+    if (fmt === "bytes") {
+      return el("td", "tabular-nums", fmtBytes(val ?? 0));
+    }
+    if (fmt === "datetime") {
+      return el("td", "text-secondary tabular-nums", val ? fmtTime(val) : "Never");
+    }
+    if (fmt === "number" || typeof val === "number") {
+      return el("td", "tabular-nums", String(val ?? 0));
+    }
+    return el("td", "", (val !== undefined && val !== null && val !== "") ? String(val) : "—");
+  }
+
+  function formatUserSummaryDetails(u, cols) {
+    const parts = [];
+    (cols || []).forEach((col) => {
+      const val = u ? u[col.key] : undefined;
+      const fmt = String(col.format || "").toLowerCase();
+      let rendered;
+      if (fmt === "bytes") rendered = fmtBytes(val ?? 0);
+      else if (fmt === "datetime") rendered = val ? fmtTime(val) : "Never";
+      else if (fmt === "number" || typeof val === "number") rendered = String(val ?? 0);
+      else if (val !== undefined && val !== null && val !== "") rendered = String(val);
+      else return;
+      parts.push((col.label || col.key) + ": " + rendered);
+    });
+    return parts.length > 0 ? parts.join(" · ") : "—";
+  }
+
+  function buildUserActionButtons(serviceName, u, userCaps, onMutated) {
+    const btns = el("div", "btn-list");
+    const rowBtns = [];
+    const setRowBusy = (busy) => {
+      rowBtns.forEach((b) => { b.disabled = busy; });
+    };
+    const label = userPrincipalLabel(u);
+    const svcEncoded = encodeURIComponent(serviceName);
+    const idEncoded = encodeURIComponent(u.id);
+
+    const canApprove = Boolean(userCaps && userCaps.approve);
+    const canDeny = Boolean(userCaps && (userCaps.deny !== undefined ? userCaps.deny : userCaps.approve));
+    const canToggle = Boolean(userCaps && userCaps.toggle_status);
+    const canSessions = Boolean(userCaps && userCaps.sessions);
+    const canDelete = Boolean(userCaps && userCaps.delete);
+
+    if (canApprove && u.status !== "active") {
+      const ap = el("button", "btn btn-sm btn-primary", "Approve");
+      ap.type = "button";
+      rowBtns.push(ap);
+      ap.addEventListener("click", async () => {
+        setRowBusy(true);
+        try {
+          await apiFetch("/api/services/" + svcEncoded + "/users/" + idEncoded + "/approve", { method: "POST" });
+          showToast("Approved " + label);
+          await Promise.resolve(onMutated());
+        } catch (err) {
+          showToast(err.message, true);
+        } finally {
+          if (ap.isConnected) setRowBusy(false);
+        }
+      });
+      btns.appendChild(ap);
+    }
+
+    if (canDeny && u.status !== "denied") {
+      const dn = el("button", "btn btn-sm btn-outline-danger", "Deny");
+      dn.type = "button";
+      rowBtns.push(dn);
+      dn.addEventListener("click", async () => {
+        const ok = await confirmAction({
+          title: "Deny user account?",
+          message: "Deny account '" + label + "' on " + serviceName + " and revoke active sessions/tokens?",
+          confirmLabel: "Deny account",
+          variant: "danger"
+        });
+        if (!ok) return;
+        setRowBusy(true);
+        try {
+          await apiFetch("/api/services/" + svcEncoded + "/users/" + idEncoded + "/deny", { method: "POST" });
+          showToast("Denied " + label);
+          await Promise.resolve(onMutated());
+        } catch (err) {
+          showToast(err.message, true);
+        } finally {
+          if (dn.isConnected) setRowBusy(false);
+        }
+      });
+      btns.appendChild(dn);
+    }
+
+    if (canToggle) {
+      const isActive = u.status === "active";
+      const nextStatus = isActive ? "disabled" : "active";
+      const tog = el("button", isActive ? "btn btn-sm btn-outline-warning" : "btn btn-sm btn-outline-success", isActive ? "Disable" : "Enable");
+      tog.type = "button";
+      rowBtns.push(tog);
+      tog.addEventListener("click", async () => {
+        if (isActive) {
+          const ok = await confirmAction({
+            title: "Disable user?",
+            message: "Disable '" + label + "' on " + serviceName + " and terminate active sessions?",
+            confirmLabel: "Disable user",
+            variant: "warning"
+          });
+          if (!ok) return;
+        }
+        setRowBusy(true);
+        try {
+          await apiFetch("/api/services/" + svcEncoded + "/users/" + idEncoded, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status: nextStatus })
+          });
+          showToast((isActive ? "Disabled " : "Enabled ") + label);
+          await Promise.resolve(onMutated());
+        } catch (err) {
+          showToast(err.message, true);
+        } finally {
+          if (tog.isConnected) setRowBusy(false);
+        }
+      });
+      btns.appendChild(tog);
+    }
+
+    if (canSessions) {
+      const lo = el("button", "btn btn-sm btn-outline-secondary", "Force Logout");
+      lo.type = "button";
+      rowBtns.push(lo);
+      lo.addEventListener("click", async () => {
+        const ok = await confirmAction({
+          title: "Force logout user?",
+          message: "Revoke all active sessions for '" + label + "' on " + serviceName + "?",
+          confirmLabel: "Revoke sessions",
+          variant: "warning"
+        });
+        if (!ok) return;
+        setRowBusy(true);
+        try {
+          const res = await apiFetch("/api/services/" + svcEncoded + "/users/" + idEncoded + "/sessions", { method: "DELETE" });
+          const revoked = res && res.revoked !== undefined ? res.revoked : 0;
+          showToast("Revoked " + revoked + " session(s) for " + label);
+          await Promise.resolve(onMutated());
+        } catch (err) {
+          showToast(err.message, true);
+        } finally {
+          if (lo.isConnected) setRowBusy(false);
+        }
+      });
+      btns.appendChild(lo);
+    }
+
+    if (canDelete) {
+      const del = el("button", "btn btn-sm btn-outline-danger", "Delete");
+      del.type = "button";
+      rowBtns.push(del);
+      del.addEventListener("click", async () => {
+        const ok = await confirmAction({
+          title: "Delete user?",
+          message: "Permanently delete '" + label + "' and all passkeys/sessions from " + serviceName + "?",
+          confirmLabel: "Delete user",
+          variant: "danger"
+        });
+        if (!ok) return;
+        setRowBusy(true);
+        try {
+          await apiFetch("/api/services/" + svcEncoded + "/users/" + idEncoded, { method: "DELETE" });
+          showToast("Deleted " + label);
+          await Promise.resolve(onMutated());
+        } catch (err) {
+          showToast(err.message, true);
+        } finally {
+          if (del.isConnected) setRowBusy(false);
+        }
+      });
+      btns.appendChild(del);
+    }
+
+    if (rowBtns.length === 0) {
+      btns.appendChild(el("span", "text-secondary small", "—"));
+    }
+    return btns;
+  }
+
+  function buildCreateInviteForm(serviceNames, idPrefix, onCreated) {
+    const wrap = el("div", "card-body border-bottom py-3");
+    const form = el("form", "row g-2 align-items-end");
+    let svcSel = null;
+
+    if (serviceNames.length > 1) {
+      const svcCol = el("div", "col-12 col-sm-4 col-lg-2");
+      const svcLbl = el("label", "form-label small text-secondary mb-1", "Service");
+      svcLbl.setAttribute("for", idPrefix + "-inv-svc");
+      svcSel = el("select", "form-select form-select-sm");
+      svcSel.id = idPrefix + "-inv-svc";
+      serviceNames.forEach((s) => {
+        const o = el("option", "", s);
+        o.value = s;
+        svcSel.appendChild(o);
+      });
+      svcCol.appendChild(svcLbl);
+      svcCol.appendChild(svcSel);
+      form.appendChild(svcCol);
+    }
+
+    const nameCol = el("div", serviceNames.length > 1 ? "col-12 col-sm-8 col-lg-4" : "col-12 col-sm-6 col-lg-5");
+    const nameLbl = el("label", "form-label small text-secondary mb-1", "Display Name");
+    nameLbl.setAttribute("for", idPrefix + "-inv-name");
+    const nameInp = el("input", "form-control form-control-sm");
+    nameInp.id = idPrefix + "-inv-name";
+    nameInp.type = "text";
+    nameInp.required = true;
+    nameInp.maxLength = 64;
+    nameInp.placeholder = "Recipient name (e.g. Alice)";
+    nameCol.appendChild(nameLbl);
+    nameCol.appendChild(nameInp);
+    form.appendChild(nameCol);
+
+    const ttlCol = el("div", "col-6 col-sm-4 col-lg-3");
+    const ttlLbl = el("label", "form-label small text-secondary mb-1", "Invite TTL");
+    ttlLbl.setAttribute("for", idPrefix + "-inv-ttl");
+    const ttlSel = el("select", "form-select form-select-sm");
+    ttlSel.id = idPrefix + "-inv-ttl";
+    [
+      { val: "24", label: "24h" },
+      { val: "168", label: "7d (default)", selected: true },
+      { val: "720", label: "30d" }
+    ].forEach((opt) => {
+      const o = el("option", "", opt.label);
+      o.value = opt.val;
+      if (opt.selected) o.selected = true;
+      ttlSel.appendChild(o);
+    });
+    ttlCol.appendChild(ttlLbl);
+    ttlCol.appendChild(ttlSel);
+    form.appendChild(ttlCol);
+
+    const btnCol = el("div", "col-6 col-sm-4 col-lg-3 d-flex align-items-end gap-2");
+    const submitBtn = el("button", "btn btn-primary btn-sm", "Create Invite");
+    submitBtn.type = "submit";
+    btnCol.appendChild(submitBtn);
+    if (serviceNames.length === 1) {
+      btnCol.appendChild(el("span", "badge bg-azure-lt", serviceNames[0]));
+    }
+    form.appendChild(btnCol);
+
+    let submitting = false;
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (submitting) return;
+      const targetSvc = svcSel ? svcSel.value : serviceNames[0];
+      const displayName = nameInp.value.trim();
+      const ttlHours = Number(ttlSel.value);
+      if (!targetSvc || !displayName) {
+        showToast("Display name is required", true);
+        return;
+      }
+      submitting = true;
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Creating…";
+      try {
+        const res = await apiFetch("/api/services/" + encodeURIComponent(targetSvc) + "/invites", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ display_name: displayName, ttl_hours: ttlHours })
+        });
+        nameInp.value = "";
+        showOneTimeSecretModal({
+          title: "Enrollment Invite Created",
+          label: "One-time Invite URL (" + targetSvc + ")",
+          secret: res.invite_url || "",
+          warning: "Share this single-use Passkey enrollment link securely. It will not be shown again once closed.",
+          meta: "Recipient: " + displayName + (res.invite && res.invite.expires_at ? (" · Expires: " + fmtTime(res.invite.expires_at)) : "")
+        });
+        await Promise.resolve(onCreated());
+      } catch (err) {
+        showToast("Failed to create invite: " + err.message, true);
+      } finally {
+        submitting = false;
+        if (submitBtn.isConnected) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Create Invite";
+        }
+      }
+    });
+
+    wrap.appendChild(form);
+    return wrap;
+  }
+
+  function buildInvitesTable(entries, showServiceCol, onMutated) {
+    const wrap = el("div", "table-responsive");
+    const tbl = el("table", "table table-vcenter card-table table-hover");
+    const thead = el("thead");
+    const hr = el("tr");
+    const headers = showServiceCol
+      ? ["Service", "Display Name", "Status", "Created By", "Expires", "Created", "Actions"]
+      : ["Display Name", "Status", "Created By", "Expires", "Created", "Actions"];
+    headers.forEach((h) => hr.appendChild(el("th", "", h)));
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+
+    const tbody = el("tbody");
+    if (!entries || entries.length === 0) {
+      tbody.appendChild(makeEmptyRow(headers.length, "No enrollment invites", "Create an invite above to enroll a new Passkey user."));
+    } else {
+      entries.forEach((item) => {
+        const inv = item.invite;
+        const svcName = item.service;
+        const tr = el("tr");
+        if (showServiceCol) {
+          const svcTd = el("td");
+          const link = el("a", "badge bg-blue-lt text-decoration-none", svcName);
+          link.href = "/services/" + encodeURIComponent(svcName);
+          svcTd.appendChild(link);
+          tr.appendChild(svcTd);
+        }
+        tr.appendChild(el("td", "fw-medium", inv.display_name || "—"));
+
+        const stTd = el("td");
+        stTd.appendChild(el("span", accessStatusBadgeClass(inv.status), inv.status || "unknown"));
+        tr.appendChild(stTd);
+
+        tr.appendChild(el("td", "text-secondary small", inv.created_by || "—"));
+        tr.appendChild(el("td", "text-secondary tabular-nums small", fmtTime(inv.expires_at)));
+        tr.appendChild(el("td", "text-secondary tabular-nums small", fmtTime(inv.created_at)));
+
+        const actTd = el("td");
+        if (inv.status === "pending" || (inv.status === "expired" && !inv.used_at)) {
+          const isPending = inv.status === "pending";
+          const cancelBtn = el("button", "btn btn-sm btn-outline-danger", isPending ? "Cancel" : "Delete");
+          cancelBtn.type = "button";
+          cancelBtn.addEventListener("click", async () => {
+            const ok = await confirmAction({
+              title: isPending ? "Cancel enrollment invite?" : "Delete expired invite?",
+              message: (isPending ? "Revoke the unused invite" : "Remove the expired invite") + " for '" + (inv.display_name || inv.id) + "' on " + svcName + "?",
+              confirmLabel: isPending ? "Cancel invite" : "Delete invite",
+              variant: "danger"
+            });
+            if (!ok) return;
+            cancelBtn.disabled = true;
+            try {
+              await apiFetch("/api/services/" + encodeURIComponent(svcName) + "/invites/" + encodeURIComponent(inv.id), { method: "DELETE" });
+              showToast((isPending ? "Canceled invite for " : "Deleted expired invite for ") + (inv.display_name || inv.id));
+              await Promise.resolve(onMutated());
+            } catch (err) {
+              showToast(err.message, true);
+            } finally {
+              if (cancelBtn.isConnected) cancelBtn.disabled = false;
+            }
+          });
+          actTd.appendChild(cancelBtn);
+        } else {
+          actTd.appendChild(el("span", "text-secondary small", inv.used_at ? ("Used " + fmtTime(inv.used_at)) : "—"));
+        }
+        tr.appendChild(actTd);
+        tbody.appendChild(tr);
+      });
+    }
+    tbl.appendChild(tbody);
+    wrap.appendChild(tbl);
+    return wrap;
+  }
+
+  function buildCreateAPIKeyForm(serviceNames, idPrefix, onCreated) {
+    const wrap = el("div", "card-body border-bottom py-3");
+    const form = el("form", "row g-2 align-items-end");
+    let svcSel = null;
+
+    if (serviceNames.length > 1) {
+      const svcCol = el("div", "col-12 col-sm-4 col-lg-2");
+      const svcLbl = el("label", "form-label small text-secondary mb-1", "Service");
+      svcLbl.setAttribute("for", idPrefix + "-key-svc");
+      svcSel = el("select", "form-select form-select-sm");
+      svcSel.id = idPrefix + "-key-svc";
+      serviceNames.forEach((s) => {
+        const o = el("option", "", s);
+        o.value = s;
+        svcSel.appendChild(o);
+      });
+      svcCol.appendChild(svcLbl);
+      svcCol.appendChild(svcSel);
+      form.appendChild(svcCol);
+    }
+
+    const nameCol = el("div", serviceNames.length > 1 ? "col-12 col-sm-8 col-lg-3" : "col-12 col-sm-6 col-lg-4");
+    const nameLbl = el("label", "form-label small text-secondary mb-1", "Key Name");
+    nameLbl.setAttribute("for", idPrefix + "-key-name");
+    const nameInp = el("input", "form-control form-control-sm");
+    nameInp.id = idPrefix + "-key-name";
+    nameInp.type = "text";
+    nameInp.required = true;
+    nameInp.maxLength = 120;
+    nameInp.placeholder = "e.g. CI Pipeline";
+    nameCol.appendChild(nameLbl);
+    nameCol.appendChild(nameInp);
+    form.appendChild(nameCol);
+
+    const ownerCol = el("div", "col-12 col-sm-6 col-lg-3");
+    const ownerLbl = el("label", "form-label small text-secondary mb-1", "Owner");
+    ownerLbl.setAttribute("for", idPrefix + "-key-owner");
+    const ownerInp = el("input", "form-control form-control-sm");
+    ownerInp.id = idPrefix + "-key-owner";
+    ownerInp.type = "text";
+    ownerInp.maxLength = 120;
+    ownerInp.placeholder = "Team or app (optional)";
+    ownerCol.appendChild(ownerLbl);
+    ownerCol.appendChild(ownerInp);
+    form.appendChild(ownerCol);
+
+    const expCol = el("div", "col-6 col-sm-3 col-lg-2");
+    const expLbl = el("label", "form-label small text-secondary mb-1", "Expiry");
+    expLbl.setAttribute("for", idPrefix + "-key-exp");
+    const expSel = el("select", "form-select form-select-sm");
+    expSel.id = idPrefix + "-key-exp";
+    [
+      { val: "", label: "Never" },
+      { val: "30", label: "30d" },
+      { val: "90", label: "90d" },
+      { val: "365", label: "1y" }
+    ].forEach((opt) => {
+      const o = el("option", "", opt.label);
+      o.value = opt.val;
+      expSel.appendChild(o);
+    });
+    expCol.appendChild(expLbl);
+    expCol.appendChild(expSel);
+    form.appendChild(expCol);
+
+    const btnCol = el("div", serviceNames.length > 1 ? "col-6 col-sm-3 col-lg-2" : "col-6 col-sm-3 col-lg-3 d-flex align-items-end gap-2");
+    const submitBtn = el("button", "btn btn-primary btn-sm", "Create API Key");
+    submitBtn.type = "submit";
+    btnCol.appendChild(submitBtn);
+    if (serviceNames.length === 1) {
+      btnCol.appendChild(el("span", "badge bg-azure-lt", serviceNames[0]));
+    }
+    form.appendChild(btnCol);
+
+    let submitting = false;
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (submitting) return;
+      const targetSvc = svcSel ? svcSel.value : serviceNames[0];
+      const name = nameInp.value.trim();
+      const owner = ownerInp.value.trim();
+      const expRaw = expSel.value;
+      if (!targetSvc || !name) {
+        showToast("Key name is required", true);
+        return;
+      }
+      const payload = { name, owner };
+      if (expRaw) {
+        payload.expires_in_days = Number(expRaw);
+      }
+      submitting = true;
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Creating…";
+      try {
+        const res = await apiFetch("/api/services/" + encodeURIComponent(targetSvc) + "/api-keys", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        nameInp.value = "";
+        ownerInp.value = "";
+        expSel.value = "";
+        const rec = res.record || {};
+        showOneTimeSecretModal({
+          title: "API Key Created",
+          label: "Bearer API Key (" + targetSvc + ")",
+          secret: res.api_key || "",
+          warning: "Copy this API key now. Only its SHA-256 hash is stored and it cannot be retrieved again.",
+          meta: "Name: " + (rec.name || name) + (rec.key_prefix ? (" · Prefix: " + rec.key_prefix) : "") + (rec.expires_at ? (" · Expires: " + fmtTime(rec.expires_at)) : " · Expires: Never")
+        });
+        await Promise.resolve(onCreated());
+      } catch (err) {
+        showToast("Failed to create API key: " + err.message, true);
+      } finally {
+        submitting = false;
+        if (submitBtn.isConnected) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Create API Key";
+        }
+      }
+    });
+
+    wrap.appendChild(form);
+    return wrap;
+  }
+
+  function buildAPIKeysTable(entries, showServiceCol, onMutated) {
+    const wrap = el("div", "table-responsive");
+    const tbl = el("table", "table table-vcenter card-table table-hover");
+    const thead = el("thead");
+    const hr = el("tr");
+    const headers = showServiceCol
+      ? ["Service", "Name", "Prefix", "Owner", "Status", "Requests", "Last Used", "Expires", "Actions"]
+      : ["Name", "Prefix", "Owner", "Status", "Requests", "Last Used", "Expires", "Actions"];
+    headers.forEach((h) => hr.appendChild(el("th", "", h)));
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+
+    const tbody = el("tbody");
+    if (!entries || entries.length === 0) {
+      tbody.appendChild(makeEmptyRow(headers.length, "No API keys configured", "Create an API key above to authorize machine clients."));
+    } else {
+      entries.forEach((item) => {
+        const key = item.key;
+        const svcName = item.service;
+        const tr = el("tr");
+        if (showServiceCol) {
+          const svcTd = el("td");
+          const link = el("a", "badge bg-blue-lt text-decoration-none", svcName);
+          link.href = "/services/" + encodeURIComponent(svcName);
+          svcTd.appendChild(link);
+          tr.appendChild(svcTd);
+        }
+        tr.appendChild(el("td", "fw-medium", key.name || "—"));
+        tr.appendChild(el("td", "font-monospace small text-secondary", key.key_prefix || "—"));
+        tr.appendChild(el("td", "text-secondary", key.owner || "—"));
+
+        const stTd = el("td");
+        stTd.appendChild(el("span", accessStatusBadgeClass(key.status), key.status || "unknown"));
+        tr.appendChild(stTd);
+
+        tr.appendChild(el("td", "tabular-nums", String(key.request_count ?? 0)));
+        tr.appendChild(el("td", "text-secondary tabular-nums small", key.last_used_at ? fmtTime(key.last_used_at) : "Never"));
+        tr.appendChild(el("td", "text-secondary tabular-nums small", key.expires_at ? fmtTime(key.expires_at) : "Never"));
+
+        const actTd = el("td");
+        const btns = el("div", "btn-list");
+        let revBtn = null;
+        let delBtn = null;
+        const setRowBusy = (busy) => {
+          if (revBtn) revBtn.disabled = busy;
+          if (delBtn) delBtn.disabled = busy;
+        };
+
+        if (key.status === "active") {
+          revBtn = el("button", "btn btn-sm btn-outline-warning", "Revoke");
+          revBtn.type = "button";
+          revBtn.addEventListener("click", async () => {
+            const ok = await confirmAction({
+              title: "Revoke API key?",
+              message: "Immediately revoke '" + (key.name || key.key_prefix) + "' on " + svcName + "? Clients using it will be rejected.",
+              confirmLabel: "Revoke key",
+              variant: "warning"
+            });
+            if (!ok) return;
+            setRowBusy(true);
+            try {
+              await apiFetch("/api/services/" + encodeURIComponent(svcName) + "/api-keys/" + encodeURIComponent(key.id) + "/revoke", { method: "POST" });
+              showToast("Revoked API key " + (key.name || key.key_prefix));
+              await Promise.resolve(onMutated());
+            } catch (err) {
+              showToast(err.message, true);
+            } finally {
+              if (revBtn.isConnected) setRowBusy(false);
+            }
+          });
+          btns.appendChild(revBtn);
+        }
+
+        delBtn = el("button", "btn btn-sm btn-outline-danger", "Delete");
+        delBtn.type = "button";
+        delBtn.addEventListener("click", async () => {
+          const ok = await confirmAction({
+            title: "Delete API key?",
+            message: "Permanently delete API key '" + (key.name || key.key_prefix) + "' from " + svcName + "?",
+            confirmLabel: "Delete key",
+            variant: "danger"
+          });
+          if (!ok) return;
+          setRowBusy(true);
+          try {
+            await apiFetch("/api/services/" + encodeURIComponent(svcName) + "/api-keys/" + encodeURIComponent(key.id), { method: "DELETE" });
+            showToast("Deleted API key " + (key.name || key.key_prefix));
+            await Promise.resolve(onMutated());
+          } catch (err) {
+            showToast(err.message, true);
+          } finally {
+            if (delBtn.isConnected) setRowBusy(false);
+          }
+        });
+        btns.appendChild(delBtn);
+        actTd.appendChild(btns);
+        tr.appendChild(actTd);
+        tbody.appendChild(tr);
+      });
+    }
+    tbl.appendChild(tbody);
+    wrap.appendChild(tbl);
+    return wrap;
+  }
+
+  // ==================== USERS & ACCESS HUB PAGE ====================
+  async function initAccess() {
+    const bannerEl = document.getElementById("access-banner");
+    const kpiGrid = document.getElementById("access-kpi-grid");
+    const filterSel = document.getElementById("access-service-filter");
+    const usersPane = document.getElementById("access-pane-users");
+    const invitesPane = document.getElementById("access-pane-invites");
+    const keysPane = document.getElementById("access-pane-api-keys");
+    const usersBadge = document.getElementById("access-badge-users");
+    const invitesBadge = document.getElementById("access-badge-invites");
+    const keysBadge = document.getElementById("access-badge-api-keys");
+    const headerStatus = document.getElementById("header-status");
+    const subtitle = document.getElementById("page-subtitle");
+    const tabsEl = document.getElementById("access-tabs");
+    const bs = getBS();
+
+    if (subtitle) {
+      subtitle.textContent = "Unified Control Plane for service users, Passkey enrollment invites, and API keys";
+    }
+
+    if (tabsEl) {
+      const tabBtns = Array.from(tabsEl.querySelectorAll('button[role="tab"]'));
+      tabBtns.forEach((btn) => {
+        if (bs && bs.Tab) {
+          bs.Tab.getOrCreateInstance(btn);
+        } else {
+          btn.addEventListener("click", () => {
+            tabBtns.forEach((b) => {
+              b.classList.remove("active");
+              b.setAttribute("aria-selected", "false");
+            });
+            [usersPane, invitesPane, keysPane].forEach((p) => p && p.classList.remove("active", "show"));
+            btn.classList.add("active");
+            btn.setAttribute("aria-selected", "true");
+            const targetSel = btn.getAttribute("data-bs-target");
+            const targetPane = targetSel ? document.querySelector(targetSel) : null;
+            if (targetPane) targetPane.classList.add("active", "show");
+          });
+        }
+      });
+    }
+
+    let overviewData = null;
+    let selectedService = "all";
+    let loadSeq = 0;
+    let loadAbort = null;
+
+    function makeSmallKPICard(label, value, badgeText, badgeCls, subtext) {
+      const col = el("div", "col-sm-6 col-xl-3");
+      const card = el("div", "card card-sm");
+      const body = el("div", "card-body");
+      const topRow = el("div", "d-flex align-items-center justify-content-between gap-2 mb-1");
+      topRow.appendChild(el("div", "subheader", label));
+      if (badgeText) topRow.appendChild(el("span", "badge tabular-nums " + (badgeCls || "bg-secondary-lt"), badgeText));
+      body.appendChild(topRow);
+      body.appendChild(el("div", "h1 mb-1 tabular-nums", String(value)));
+      body.appendChild(el("div", "text-secondary small", subtext));
+      card.appendChild(body);
+      col.appendChild(card);
+      return col;
+    }
+
+    function renderHeaderControls(services, degradedCount, initialError) {
+      if (!headerStatus) return;
+      clear(headerStatus);
+      const pillCls = initialError ? "status-red" : (degradedCount > 0 ? "status-yellow" : "status-green");
+      const pill = el("span", "status " + pillCls);
+      pill.appendChild(el("span", "status-dot" + (!initialError && degradedCount === 0 ? " status-dot-animated" : "")));
+      const pillText = initialError
+        ? " Overview error"
+        : (" " + services.length + " service(s)" + (degradedCount > 0 ? (" · " + degradedCount + " degraded") : ""));
+      pill.appendChild(document.createTextNode(pillText));
+      headerStatus.appendChild(pill);
+
+      const refreshBtn = el("button", "btn btn-sm btn-outline-secondary", "Refresh");
+      refreshBtn.type = "button";
+      refreshBtn.addEventListener("click", () => loadOverview());
+      headerStatus.appendChild(refreshBtn);
+    }
+
+    function renderOverview() {
+      if (!overviewData) return;
+      const summary = overviewData.summary || {};
+      const services = Array.isArray(overviewData.services) ? overviewData.services : [];
+      const discoveryErr = overviewData.discovery_error || "";
+
+      renderHeaderControls(services, summary.degraded_services || (discoveryErr ? 1 : 0), false);
+
+      // Degraded service / discovery error banner
+      if (bannerEl) {
+        const notices = [];
+        if (discoveryErr) notices.push(discoveryErr);
+        services.filter((s) => !s.reachable || s.error).forEach((s) => {
+          notices.push(s.service + " (" + (s.error || "unreachable") + ")");
+        });
+        if (notices.length > 0) {
+          clear(bannerEl);
+          bannerEl.appendChild(el("strong", "me-1", "Partial degradation:"));
+          bannerEl.appendChild(document.createTextNode(notices.join(" · ")));
+          bannerEl.classList.remove("d-none");
+        } else {
+          bannerEl.classList.add("d-none");
+          clear(bannerEl);
+        }
+      }
+
+      // KPI cards
+      if (kpiGrid) {
+        clear(kpiGrid);
+        kpiGrid.appendChild(makeSmallKPICard(
+          "Total Users",
+          summary.total_users || 0,
+          (summary.active_users || 0) + " active",
+          "bg-green-lt",
+          (summary.disabled_users || 0) + " disabled or denied"
+        ));
+        kpiGrid.appendChild(makeSmallKPICard(
+          "Pending Approvals",
+          summary.pending_approvals || 0,
+          (summary.pending_approvals || 0) > 0 ? "Action needed" : "Clear",
+          (summary.pending_approvals || 0) > 0 ? "bg-yellow-lt" : "bg-green-lt",
+          "Account requests awaiting operator review"
+        ));
+        kpiGrid.appendChild(makeSmallKPICard(
+          "Pending Invites",
+          summary.pending_invites || 0,
+          (summary.total_invites || 0) + " total",
+          "bg-azure-lt",
+          "Unused single-use Passkey enrollment links"
+        ));
+        kpiGrid.appendChild(makeSmallKPICard(
+          "Active API Keys",
+          summary.active_api_keys || 0,
+          (summary.total_api_keys || 0) + " total",
+          "bg-blue-lt",
+          "Active machine credentials across services"
+        ));
+      }
+
+      // Service filter options
+      if (filterSel) {
+        const prev = selectedService;
+        clear(filterSel);
+        const allOpt = el("option", "", "All services");
+        allOpt.value = "all";
+        filterSel.appendChild(allOpt);
+        services.forEach((s) => {
+          const opt = el("option", "", s.name || s.service);
+          opt.value = s.service;
+          filterSel.appendChild(opt);
+        });
+        if (prev !== "all" && services.some((s) => s.service === prev)) {
+          filterSel.value = prev;
+        } else {
+          selectedService = "all";
+          filterSel.value = "all";
+        }
+      }
+
+      const visibleServices = selectedService === "all"
+        ? services
+        : services.filter((s) => s.service === selectedService);
+
+      // Aggregate Users
+      const userRows = [];
+      visibleServices.forEach((svc) => {
+        if (Array.isArray(svc.users)) {
+          svc.users.forEach((u) => userRows.push({ service: svc, user: u }));
+        }
+      });
+      if (usersBadge) usersBadge.textContent = String(userRows.length);
+
+      if (usersPane) {
+        clear(usersPane);
+        const userErrors = visibleServices.filter((s) => s.users_error);
+        if (userErrors.length > 0) {
+          const errWrap = el("div", "card-body border-bottom py-2");
+          errWrap.appendChild(el("div", "alert alert-warning mb-0 py-2 small", userErrors.map((s) => s.service + ": " + s.users_error).join(" · ")));
+          usersPane.appendChild(errWrap);
+        }
+        const wrap = el("div", "table-responsive");
+        const tbl = el("table", "table table-vcenter card-table table-hover");
+        const thead = el("thead");
+        const hr = el("tr");
+        ["Service", "Principal", "Status", "Details", "Created", "Actions"].forEach((h) => hr.appendChild(el("th", "", h)));
+        thead.appendChild(hr);
+        tbl.appendChild(thead);
+
+        const tbody = el("tbody");
+        if (userRows.length === 0) {
+          tbody.appendChild(makeEmptyRow(6, "No users found", "Discovered user-capable services currently have no accounts matching this filter."));
+        } else {
+          userRows.forEach((row) => {
+            const svc = row.service;
+            const u = row.user;
+            const userCaps = resolveUserCapabilities(svc);
+            const userCols = resolveUserColumns(svc);
+            const tr = el("tr");
+
+            const svcTd = el("td");
+            const svcLink = el("a", "badge bg-blue-lt text-decoration-none", svc.service);
+            svcLink.href = "/services/" + encodeURIComponent(svc.service);
+            svcTd.appendChild(svcLink);
+            tr.appendChild(svcTd);
+
+            const nameTd = el("td");
+            nameTd.appendChild(el("span", "fw-medium", userPrincipalLabel(u)));
+            if (u.role) {
+              nameTd.appendChild(el("span", "badge bg-secondary-lt ms-2", u.role));
+            }
+            tr.appendChild(nameTd);
+
+            const stTd = el("td");
+            stTd.appendChild(el("span", accessStatusBadgeClass(u.status), u.status || "unknown"));
+            tr.appendChild(stTd);
+
+            const detailCols = u.role ? userCols.filter((c) => c.key !== "role") : userCols;
+            tr.appendChild(el("td", "text-secondary small tabular-nums", formatUserSummaryDetails(u, detailCols)));
+            tr.appendChild(el("td", "text-secondary small tabular-nums", fmtTime(u.created_at)));
+
+            const actTd = el("td");
+            actTd.appendChild(buildUserActionButtons(svc.service, u, userCaps, () => loadOverview()));
+            tr.appendChild(actTd);
+            tbody.appendChild(tr);
+          });
+        }
+        tbl.appendChild(tbody);
+        wrap.appendChild(tbl);
+        usersPane.appendChild(wrap);
+      }
+
+      // Aggregate Invites
+      const inviteCapServices = visibleServices
+        .filter((s) => s.reachable && Array.isArray(s.capabilities) && s.capabilities.includes("invites"))
+        .map((s) => s.service);
+      const inviteRows = [];
+      visibleServices.forEach((svc) => {
+        if (Array.isArray(svc.invites)) {
+          svc.invites.forEach((inv) => inviteRows.push({ service: svc.service, invite: inv }));
+        }
+      });
+      const pendingInvCount = inviteRows.filter((r) => r.invite && r.invite.status === "pending").length;
+      if (invitesBadge) invitesBadge.textContent = String(pendingInvCount);
+
+      if (invitesPane) {
+        clear(invitesPane);
+        const invErrors = visibleServices.filter((s) => s.invites_error);
+        if (invErrors.length > 0) {
+          const errWrap = el("div", "card-body border-bottom py-2");
+          errWrap.appendChild(el("div", "alert alert-warning mb-0 py-2 small", invErrors.map((s) => s.service + ": " + s.invites_error).join(" · ")));
+          invitesPane.appendChild(errWrap);
+        }
+        if (inviteCapServices.length > 0) {
+          invitesPane.appendChild(buildCreateInviteForm(inviteCapServices, "hub", () => loadOverview()));
+        }
+        invitesPane.appendChild(buildInvitesTable(inviteRows, true, () => loadOverview()));
+      }
+
+      // Aggregate API Keys
+      const keyCapServices = visibleServices
+        .filter((s) => s.reachable && Array.isArray(s.capabilities) && s.capabilities.includes("api_keys"))
+        .map((s) => s.service);
+      const keyRows = [];
+      visibleServices.forEach((svc) => {
+        if (Array.isArray(svc.api_keys)) {
+          svc.api_keys.forEach((k) => keyRows.push({ service: svc.service, key: k }));
+        }
+      });
+      const activeKeyCount = keyRows.filter((r) => r.key && r.key.status === "active").length;
+      if (keysBadge) keysBadge.textContent = String(activeKeyCount);
+
+      if (keysPane) {
+        clear(keysPane);
+        const keyErrors = visibleServices.filter((s) => s.api_keys_error);
+        if (keyErrors.length > 0) {
+          const errWrap = el("div", "card-body border-bottom py-2");
+          errWrap.appendChild(el("div", "alert alert-warning mb-0 py-2 small", keyErrors.map((s) => s.service + ": " + s.api_keys_error).join(" · ")));
+          keysPane.appendChild(errWrap);
+        }
+        if (keyCapServices.length > 0) {
+          keysPane.appendChild(buildCreateAPIKeyForm(keyCapServices, "hub", () => loadOverview()));
+        }
+        keysPane.appendChild(buildAPIKeysTable(keyRows, true, () => loadOverview()));
+      }
+    }
+
+    async function loadOverview() {
+      const seq = ++loadSeq;
+      if (loadAbort) {
+        loadAbort.abort();
+        loadAbort = null;
+      }
+      const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+      loadAbort = ctrl;
+
+      try {
+        const data = await apiFetch("/api/access/overview", ctrl ? { signal: ctrl.signal } : undefined);
+        if (seq !== loadSeq) return;
+        overviewData = data;
+        renderOverview();
+      } catch (err) {
+        if ((err && err.name === "AbortError") || seq !== loadSeq) return;
+        if (bannerEl) {
+          bannerEl.textContent = "Failed to load access overview: " + err.message;
+          bannerEl.classList.remove("d-none");
+        }
+        if (!overviewData) {
+          renderHeaderControls([], 1, true);
+          [usersPane, invitesPane, keysPane].forEach((pane) => {
+            if (!pane) return;
+            clear(pane);
+            pane.appendChild(el("div", "card-body text-secondary", "Unable to load data. Use Refresh to retry."));
+          });
+        }
+        showToast("Failed to load access overview: " + err.message, true);
+      } finally {
+        if (loadAbort === ctrl) loadAbort = null;
+      }
+    }
+
+    if (filterSel) {
+      filterSel.addEventListener("change", () => {
+        selectedService = filterSel.value || "all";
+        renderOverview();
+      });
+    }
+
+    window.addEventListener("pagehide", () => {
+      if (loadAbort) {
+        loadAbort.abort();
+        loadAbort = null;
+      }
+    });
+
+    renderHeaderControls([], 0, false);
+    loadOverview();
+  }
+
   // ==================== MANAGED SERVICE PAGE ====================
   async function initService() {
     const banner = document.getElementById("service-banner");
@@ -2087,12 +3200,23 @@
       const seq = bumpPaneSeq(pane);
       const isStale = () => isPaneStale(pane, seq);
       clear(pane);
-      pane.appendChild(el("div", "card-body text-secondary", "Loading " + cap + "…"));
+      pane.appendChild(el("div", "card-body text-secondary", "Loading " + formatCapLabel(cap) + "…"));
       try {
         if (cap === "users") await renderUsersTab(pane, isStale);
+        else if (cap === "invites") await renderInvitesTab(pane, isStale);
+        else if (cap === "api_keys") await renderAPIKeysTab(pane, isStale);
         else if (cap === "settings") await renderSettingsTab(pane, manifest.settings_schema || [], isStale);
         else if (cap === "artifacts") await renderArtifactsTab(pane, "", isStale, true);
-        else {
+        else if (cap === "classify") {
+          if (isStale()) return;
+          clear(pane);
+          const body = el("div", "card-body");
+          body.appendChild(el("p", "mb-2", "This service provides internal Amber AI batch log classification (" + (manifest.model || "amber-150m") + ") for the Control Plane."));
+          const link = el("a", "btn btn-sm btn-outline-primary", "Open Log Explorer");
+          link.href = "/logs";
+          body.appendChild(link);
+          pane.appendChild(body);
+        } else {
           if (isStale()) return;
           clear(pane);
           pane.appendChild(el("div", "card-body text-secondary", "Unsupported capability: " + cap));
@@ -2101,7 +3225,7 @@
         if (isStale()) return;
         clear(pane);
         const body = el("div", "card-body");
-        body.appendChild(el("div", "alert alert-danger mb-0", "Failed to load " + cap + ": " + err.message));
+        body.appendChild(el("div", "alert alert-danger mb-0", "Failed to load " + formatCapLabel(cap) + ": " + err.message));
         pane.appendChild(body);
       }
     }
@@ -2118,7 +3242,7 @@
 
       const li = el("li", "nav-item");
       li.setAttribute("role", "presentation");
-      const btn = el("button", "nav-link" + (isFirst ? " active" : ""), cap.toUpperCase());
+      const btn = el("button", "nav-link" + (isFirst ? " active" : ""), formatCapLabel(cap));
       btn.id = tabId;
       btn.type = "button";
       btn.setAttribute("role", "tab");
@@ -2166,84 +3290,46 @@
       const data = await apiFetch("/api/services/" + encodeURIComponent(activeService) + "/users");
       if (isStale && isStale()) return;
       clear(container);
+
+      const userCaps = resolveUserCapabilities(manifest);
+      const userCols = resolveUserColumns(manifest);
+
       const wrap = el("div", "table-responsive");
       const tbl = el("table", "table table-vcenter card-table table-hover");
       const thead = el("thead");
       const hr = el("tr");
-      ["Username", "Role", "Status", "Artifacts", "Storage", "Created", "Actions"].forEach((h) => hr.appendChild(el("th", "", h)));
+      hr.appendChild(el("th", "", "User"));
+      hr.appendChild(el("th", "", "Status"));
+      userCols.forEach((col) => hr.appendChild(el("th", "", col.label || col.key)));
+      hr.appendChild(el("th", "", "Created"));
+      hr.appendChild(el("th", "", "Actions"));
       thead.appendChild(hr);
       tbl.appendChild(thead);
 
+      const totalCols = 4 + userCols.length;
       const tbody = el("tbody");
       const users = data.users || [];
       if (users.length === 0) {
-        tbody.appendChild(makeEmptyRow(7, "No users found", ""));
+        tbody.appendChild(makeEmptyRow(totalCols, "No users found", ""));
       } else {
         users.forEach((u) => {
           const tr = el("tr");
-          tr.appendChild(el("td", "fw-medium", u.username));
-
-          const roleTd = el("td");
-          roleTd.appendChild(el("span", "badge bg-secondary-lt", u.role || "user"));
-          tr.appendChild(roleTd);
+          tr.appendChild(el("td", "fw-medium", userPrincipalLabel(u)));
 
           const stTd = el("td");
-          const cls = u.status === "active" ? "badge bg-green-lt" : (u.status === "pending" ? "badge bg-yellow-lt" : "badge bg-red-lt");
-          stTd.appendChild(el("span", cls, u.status));
+          stTd.appendChild(el("span", accessStatusBadgeClass(u.status), u.status || "unknown"));
           tr.appendChild(stTd);
 
-          tr.appendChild(el("td", "tabular-nums", String(u.artifact_count ?? 0)));
-          tr.appendChild(el("td", "tabular-nums", fmtBytes(u.storage_bytes ?? 0)));
+          userCols.forEach((col) => {
+            tr.appendChild(formatUserColumnCell(u, col));
+          });
+
           tr.appendChild(el("td", "text-secondary tabular-nums", fmtTime(u.created_at)));
 
           const actTd = el("td");
-          const btns = el("div", "btn-list");
-          let ap = null;
-          let dn = null;
-          const setRowBusy = (busy) => {
-            if (ap) ap.disabled = busy;
-            if (dn) dn.disabled = busy;
-          };
-          if (u.status !== "active") {
-            ap = el("button", "btn btn-sm btn-primary", "Approve");
-            ap.type = "button";
-            ap.addEventListener("click", async () => {
-              setRowBusy(true);
-              try {
-                await apiFetch("/api/services/" + encodeURIComponent(activeService) + "/users/" + encodeURIComponent(u.id) + "/approve", { method: "POST" });
-                showToast("Approved " + u.username);
-                if (container.classList.contains("active")) loadTab("users", container);
-              } catch (err) {
-                showToast(err.message, true);
-                setRowBusy(false);
-              }
-            });
-            btns.appendChild(ap);
-          }
-          if (u.status !== "denied") {
-            dn = el("button", "btn btn-sm btn-outline-danger", "Deny");
-            dn.type = "button";
-            dn.addEventListener("click", async () => {
-              const ok = await confirmAction({
-                title: "Deny user account?",
-                message: "Deny account '" + u.username + "' and revoke active sessions/tokens?",
-                confirmLabel: "Deny account",
-                variant: "danger"
-              });
-              if (!ok) return;
-              setRowBusy(true);
-              try {
-                await apiFetch("/api/services/" + encodeURIComponent(activeService) + "/users/" + encodeURIComponent(u.id) + "/deny", { method: "POST" });
-                showToast("Denied " + u.username);
-                if (container.classList.contains("active")) loadTab("users", container);
-              } catch (err) {
-                showToast(err.message, true);
-                setRowBusy(false);
-              }
-            });
-            btns.appendChild(dn);
-          }
-          actTd.appendChild(btns);
+          actTd.appendChild(buildUserActionButtons(activeService, u, userCaps, () => {
+            if (container.classList.contains("active")) return loadTab("users", container);
+          }));
           tr.appendChild(actTd);
           tbody.appendChild(tr);
         });
@@ -2251,6 +3337,30 @@
       tbl.appendChild(tbody);
       wrap.appendChild(tbl);
       container.appendChild(wrap);
+    }
+
+    async function renderInvitesTab(container, isStale) {
+      const data = await apiFetch("/api/services/" + encodeURIComponent(activeService) + "/invites");
+      if (isStale && isStale()) return;
+      clear(container);
+      const reload = () => {
+        if (container.classList.contains("active")) return loadTab("invites", container);
+      };
+      container.appendChild(buildCreateInviteForm([activeService], "svc", reload));
+      const rows = (data.invites || []).map((inv) => ({ service: activeService, invite: inv }));
+      container.appendChild(buildInvitesTable(rows, false, reload));
+    }
+
+    async function renderAPIKeysTab(container, isStale) {
+      const data = await apiFetch("/api/services/" + encodeURIComponent(activeService) + "/api-keys");
+      if (isStale && isStale()) return;
+      clear(container);
+      const reload = () => {
+        if (container.classList.contains("active")) return loadTab("api_keys", container);
+      };
+      container.appendChild(buildCreateAPIKeyForm([activeService], "svc", reload));
+      const rows = (data.api_keys || []).map((k) => ({ service: activeService, key: k }));
+      container.appendChild(buildAPIKeysTable(rows, false, reload));
     }
 
     async function renderSettingsTab(container, schema, isStale) {
@@ -2585,12 +3695,27 @@
   // ==================== AUDIT LOG PAGE ====================
   function auditActionBadgeClass(action) {
     switch (action) {
-      case "user_approve": return "badge bg-green-lt";
+      case "user_approve":
+      case "user.approve":
+      case "invite.create":
+      case "api_key.create":
+        return "badge bg-green-lt";
       case "user_deny":
-      case "artifact_delete": return "badge bg-red-lt";
-      case "settings_update": return "badge bg-yellow-lt";
-      case "login": return "badge bg-azure-lt";
-      default: return "badge bg-secondary-lt";
+      case "user.deny":
+      case "user.delete":
+      case "invite.delete":
+      case "api_key.delete":
+      case "artifact_delete":
+        return "badge bg-red-lt";
+      case "settings_update":
+      case "user.status_update":
+      case "user.sessions_revoke":
+      case "api_key.revoke":
+        return "badge bg-yellow-lt";
+      case "login":
+        return "badge bg-azure-lt";
+      default:
+        return "badge bg-secondary-lt";
     }
   }
 
@@ -2742,7 +3867,10 @@
 
   initTheme();
 
-  if (page === "overview") initOverview();
+  if (page === "overview" && window.location.hash === "#access") {
+    window.location.replace("/access");
+  } else if (page === "overview") initOverview();
+  else if (page === "access") initAccess();
   else if (page === "logs") initLogs();
   else if (page === "service") initService();
   else if (page === "audit") initAudit();

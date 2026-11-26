@@ -495,12 +495,14 @@ func TestTablerStaticVendoringAndStrictCSP(t *testing.T) {
 	if !strings.Contains(ovBody, `src="/static/vendor/chart.umd.min.js?v=`+devSrv.assetVersion+`"`) {
 		t.Fatalf("GET / missing versioned chart.umd.min.js script tag")
 	}
-	for _, p := range []string{"/", "/logs", "/audit", "/services/artifact"} {
+	for _, p := range []string{"/", "/access", "/logs", "/audit", "/services/artifact"} {
 		body := assertPageSecure(t, h, p, devSrv.assetVersion)
 		for _, marker := range []string{
 			"data-theme-toggle",
 			`data-bs-toggle="collapse" data-bs-target="#sidebar-menu"`,
 			`id="confirm-modal"`,
+			`id="secret-modal"`,
+			`id="nav-access"`,
 			`id="toast"`,
 			`name="csrf_token"`,
 			"align-items-center d-lg-none",
@@ -509,6 +511,13 @@ func TestTablerStaticVendoringAndStrictCSP(t *testing.T) {
 				t.Fatalf("GET %s missing expected UI element %q", p, marker)
 			}
 		}
+	}
+	if accessBody := assertPageSecure(t, h, "/access", devSrv.assetVersion); !strings.Contains(accessBody, `id="access"`) ||
+		!strings.Contains(accessBody, `id="access-kpi-grid"`) ||
+		!strings.Contains(accessBody, `id="access-tabs"`) ||
+		!strings.Contains(accessBody, `id="access-service-filter"`) ||
+		!strings.Contains(accessBody, `id="secret-modal-input"`) {
+		t.Fatalf("GET /access missing expected Users & Access hub UI elements")
 	}
 	if logsBody := assertPageSecure(t, h, "/logs", devSrv.assetVersion); !strings.Contains(logsBody, `role="switch"`) ||
 		!strings.Contains(logsBody, `id="log-scan-rules-btn"`) ||
@@ -1111,5 +1120,495 @@ func TestSSESessionRevocationClosesStreamsOnHeartbeat(t *testing.T) {
 				t.Fatalf("expected initial 200 for %s, got %d", path, rec.Code)
 			}
 		})
+	}
+}
+
+func TestUsersAndAccessControlPlaneRoutesAuditAndSecurity(t *testing.T) {
+	const (
+		audownUserID   = "11111111-1111-1111-1111-111111111111"
+		audownInviteID = "22222222-2222-2222-2222-222222222222"
+		choiceKeyID    = "33333333-3333-3333-3333-333333333333"
+		rawInviteTok   = "SUPER_SECRET_INVITE_TOKEN_XYZ987654321"
+		rawInviteURL   = "https://audown.cubus.sh/invite/" + rawInviteTok
+		rawAPIKey      = "chk_SUPER_SECRET_API_KEY_PLAINTEXT_987654321"
+		keyPrefix      = "chk_SUPER_SE"
+	)
+
+	var (
+		gotInviteCreatedBy string
+		gotInviteTTL       *int
+		gotKeyCreatedBy    string
+		gotKeyExpiresDays  *int
+		gotPatchedStatus   string
+	)
+
+	// Mock audown :9090 Admin API
+	audownSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok-audown-secret" {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/v1/manifest":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"service":      "audown",
+				"version":      "0.2.0",
+				"capabilities": []string{"settings", "users", "invites"},
+				"user_capabilities": map[string]bool{
+					"create":         false,
+					"approve":        false,
+					"toggle_status":  true,
+					"reset_password": false,
+					"change_role":    false,
+					"delete":         true,
+					"sessions":       true,
+					"invites":        true,
+				},
+				"user_columns": []map[string]any{
+					{"key": "active_sessions", "label": "Sessions"},
+					{"key": "last_login_at", "label": "Last Login", "format": "datetime"},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/v1/users":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"users": []map[string]any{
+					{
+						"id":              audownUserID,
+						"display_name":    "Carol",
+						"username":        "Carol",
+						"status":          "active",
+						"active_sessions": 2,
+						"last_login_at":   "2026-11-26T00:00:00Z",
+						"created_at":      "2026-11-20T00:00:00Z",
+					},
+				},
+			})
+		case r.Method == http.MethodPatch && r.URL.Path == "/admin/v1/users/"+audownUserID:
+			var body struct {
+				Status string `json:"status"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, `{"error":"bad json"}`, http.StatusBadRequest)
+				return
+			}
+			gotPatchedStatus = body.Status
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":           audownUserID,
+				"display_name": "Carol",
+				"status":       body.Status,
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/admin/v1/users/"+audownUserID+"/sessions":
+			_ = json.NewEncoder(w).Encode(map[string]any{"revoked": 2, "user_id": audownUserID})
+		case r.Method == http.MethodDelete && r.URL.Path == "/admin/v1/users/"+audownUserID:
+			_ = json.NewEncoder(w).Encode(map[string]any{"deleted": true, "id": audownUserID})
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/v1/invites":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"invites": []map[string]any{
+					{
+						"id":           audownInviteID,
+						"display_name": "Eve",
+						"status":       "pending",
+						"expires_at":   "2026-12-03T00:00:00Z",
+						"created_by":   "owner@cubus.sh",
+						"created_at":   "2026-11-26T00:00:00Z",
+					},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/admin/v1/invites":
+			var body struct {
+				DisplayName string `json:"display_name"`
+				TTLHours    *int   `json:"ttl_hours"`
+				CreatedBy   string `json:"created_by"`
+			}
+			dec := json.NewDecoder(r.Body)
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&body); err != nil {
+				http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+				return
+			}
+			gotInviteCreatedBy = body.CreatedBy
+			gotInviteTTL = body.TTLHours
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"invite": map[string]any{
+					"id":           audownInviteID,
+					"display_name": body.DisplayName,
+					"status":       "pending",
+					"expires_at":   "2026-12-03T00:00:00Z",
+					"created_by":   body.CreatedBy,
+					"created_at":   "2026-11-26T00:00:00Z",
+				},
+				"invite_url": rawInviteURL,
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/admin/v1/invites/"+audownInviteID:
+			_ = json.NewEncoder(w).Encode(map[string]any{"deleted": true, "id": audownInviteID})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer audownSrv.Close()
+
+	// Mock choice :9090 Admin API
+	choiceSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok-choice-secret" {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/v1/manifest":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"service":      "choice",
+				"version":      "0.1.0",
+				"model":        "amber-150m",
+				"capabilities": []string{"settings", "classify", "api_keys"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/v1/api-keys":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"api_keys": []map[string]any{
+					{
+						"id":            choiceKeyID,
+						"name":          "CI Pipeline",
+						"owner":         "platform",
+						"key_prefix":    keyPrefix,
+						"status":        "active",
+						"request_count": 42,
+						"created_by":    "owner@cubus.sh",
+						"created_at":    "2026-11-26T00:00:00Z",
+					},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/admin/v1/api-keys":
+			var body struct {
+				Name          string `json:"name"`
+				Owner         string `json:"owner"`
+				ExpiresInDays *int   `json:"expires_in_days"`
+				CreatedBy     string `json:"created_by"`
+			}
+			dec := json.NewDecoder(r.Body)
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&body); err != nil {
+				http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+				return
+			}
+			gotKeyCreatedBy = body.CreatedBy
+			gotKeyExpiresDays = body.ExpiresInDays
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"api_key": rawAPIKey,
+				"record": map[string]any{
+					"id":            choiceKeyID,
+					"name":          body.Name,
+					"owner":         body.Owner,
+					"key_prefix":    keyPrefix,
+					"status":        "active",
+					"request_count": 0,
+					"created_by":    body.CreatedBy,
+					"created_at":    "2026-11-26T00:00:00Z",
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/admin/v1/api-keys/"+choiceKeyID+"/revoke":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":         choiceKeyID,
+				"name":       "CI Pipeline",
+				"owner":      "platform",
+				"key_prefix": keyPrefix,
+				"status":     "revoked",
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/admin/v1/api-keys/"+choiceKeyID:
+			_ = json.NewEncoder(w).Encode(map[string]any{"deleted": true, "id": choiceKeyID})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer choiceSrv.Close()
+
+	// Mock legacy artifact :9090 Admin API (NO user_capabilities)
+	artSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/v1/manifest":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"service":      "artifact",
+				"version":      "0.2.0",
+				"capabilities": []string{"users", "settings", "artifacts"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/v1/users":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"users": []map[string]any{
+					{"id": "art-u1", "username": "alice", "role": "user", "status": "pending", "artifact_count": 1, "storage_bytes": 512},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/admin/v1/users/art-u1/approve":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "art-u1", "status": "active"})
+		case r.Method == http.MethodPost && r.URL.Path == "/admin/v1/users/art-u1/deny":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "art-u1", "status": "denied"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer artSrv.Close()
+
+	// Offline service to verify partial degradation
+	offlineSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	offlineURL := offlineSrv.URL
+	offlineSrv.Close()
+
+	var logBuf bytes.Buffer
+	pfx := netip.MustParsePrefix("127.0.0.0/8")
+	cfg := config.Config{
+		PublicBaseURL:    "http://127.0.0.1:8000",
+		PublicIsLoopback: true,
+		AuthMode:         config.AuthModeDev,
+		DevAuthEmail:     "owner@cubus.sh",
+		AllowedEmails:    map[string]struct{}{"owner@cubus.sh": {}},
+		AdminNetworkCIDR: &pfx,
+		ServiceTokens: map[string]string{
+			"artifact": "tok-art-secret",
+			"audown":   "tok-audown-secret",
+			"choice":   "tok-choice-secret",
+			"broken":   "tok-broken-secret",
+		},
+		StaticServices: map[string]string{
+			"artifact": artSrv.URL,
+			"audown":   audownSrv.URL,
+			"choice":   choiceSrv.URL,
+			"broken":   offlineURL,
+		},
+	}
+
+	st := store.NewMemoryStore()
+	authenticator, err := auth.NewAuthenticator(context.Background(), cfg, st, auth.AuthenticatorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svcCli := clients.NewServiceClient(cfg, nil)
+	srv, err := New(cfg, st, authenticator, nil, nil, svcCli, slog.New(slog.NewTextHandler(&logBuf, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.Handler()
+
+	// Obtain CSRF cookie from GET /access
+	accPageReq := httptest.NewRequest(http.MethodGet, "/access", nil)
+	accPageReq.RemoteAddr = "127.0.0.1:50300"
+	accPageRec := httptest.NewRecorder()
+	h.ServeHTTP(accPageRec, accPageReq)
+	if accPageRec.Code != http.StatusOK {
+		t.Fatalf("GET /access failed: %d", accPageRec.Code)
+	}
+	csrfCookie := accPageRec.Result().Cookies()[0]
+
+	doRead := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = "127.0.0.1:50301"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	doWrite := func(method, path, body string, withCSRF bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		req.RemoteAddr = "127.0.0.1:50302"
+		req.Header.Set("Origin", "http://127.0.0.1:8000")
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if withCSRF {
+			req.AddCookie(csrfCookie)
+			req.Header.Set("X-CSRF-Token", csrfCookie.Value)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. GET /api/access/overview aggregates artifact, audown, choice + degrades gracefully on broken
+	ovRec := doRead("/api/access/overview")
+	if ovRec.Code != http.StatusOK || ovRec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("GET /api/access/overview unexpected: status=%d cc=%q body=%s", ovRec.Code, ovRec.Header().Get("Cache-Control"), ovRec.Body.String())
+	}
+	var ov clients.AccessOverview
+	if err := json.Unmarshal(ovRec.Body.Bytes(), &ov); err != nil {
+		t.Fatalf("unmarshal access overview: %v", err)
+	}
+	if ov.Summary.TotalUsers != 2 || ov.Summary.PendingApprovals != 1 || ov.Summary.PendingInvites != 1 || ov.Summary.ActiveAPIKeys != 1 || ov.Summary.DegradedServices != 1 {
+		t.Fatalf("unexpected access overview summary: %+v", ov.Summary)
+	}
+
+	// 2. Read routes work with capability checks
+	if rec := doRead("/api/services/audown/invites"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), audownInviteID) {
+		t.Fatalf("GET audown invites failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doRead("/api/services/choice/api-keys"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), choiceKeyID) {
+		t.Fatalf("GET choice api-keys failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doRead("/api/services/choice/users"); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for choice /users, got %d", rec.Code)
+	}
+	if rec := doRead("/api/services/artifact/invites"); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for artifact /invites, got %d", rec.Code)
+	}
+	if rec := doRead("/api/services/audown/api-keys"); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for audown /api-keys, got %d", rec.Code)
+	}
+
+	// 3. CSRF enforcement on new mutating routes
+	if rec := doWrite(http.MethodPatch, "/api/services/audown/users/"+audownUserID, `{"status":"disabled"}`, false); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without CSRF on PATCH user, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodPost, "/api/services/audown/invites", `{"display_name":"Eve"}`, false); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without CSRF on POST invite, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodPost, "/api/services/choice/api-keys", `{"name":"CI"}`, false); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without CSRF on POST api-keys, got %d", rec.Code)
+	}
+
+	// 4. Capability enforcement blocks disallowed mutations across services
+	if rec := doWrite(http.MethodPatch, "/api/services/artifact/users/art-u1", `{"status":"disabled"}`, true); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for artifact PATCH user, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodDelete, "/api/services/artifact/users/art-u1", "", true); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for artifact DELETE user, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodDelete, "/api/services/artifact/users/art-u1/sessions", "", true); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for artifact DELETE sessions, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodPost, "/api/services/audown/users/"+audownUserID+"/approve", "", true); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for audown approve, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodPost, "/api/services/choice/invites", `{"display_name":"Eve"}`, true); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for choice POST invites, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodPost, "/api/services/audown/api-keys", `{"name":"CI"}`, true); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for audown POST api-keys, got %d", rec.Code)
+	}
+
+	// 5. Strict path param & payload validation
+	if rec := doWrite(http.MethodDelete, "/api/services/audown/users/bad%2Fid", "", true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for traversal user id, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodDelete, "/api/services/audown/invites/"+strings.Repeat("a", 65), "", true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for overly long invite id, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodPatch, "/api/services/audown/users/"+audownUserID, `{"status":"bogus"}`, true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid user status, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodPost, "/api/services/audown/invites", `{"display_name":"Bad\nName"}`, true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for control char in invite display_name, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodPost, "/api/services/choice/api-keys", `{"name":"CI","expires_in_days":45}`, true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid expires_in_days, got %d", rec.Code)
+	}
+	if rec := doWrite(http.MethodPost, "/api/services/choice/api-keys", `{"name":"CI","unknown":true}`, true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown field, got %d", rec.Code)
+	}
+
+	// 6. Execute ALL mutations and verify operator created_by injection + Cache-Control: no-store + audit_logs
+	if rec := doWrite(http.MethodPost, "/api/services/artifact/users/art-u1/approve", "", true); rec.Code != http.StatusOK {
+		t.Fatalf("artifact approve failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doWrite(http.MethodPost, "/api/services/artifact/users/art-u1/deny", "", true); rec.Code != http.StatusOK {
+		t.Fatalf("artifact deny failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doWrite(http.MethodPatch, "/api/services/audown/users/"+audownUserID, `{"status":"disabled"}`, true); rec.Code != http.StatusOK || gotPatchedStatus != "disabled" {
+		t.Fatalf("audown PATCH user failed: %d status=%q body=%s", rec.Code, gotPatchedStatus, rec.Body.String())
+	}
+	if rec := doWrite(http.MethodDelete, "/api/services/audown/users/"+audownUserID+"/sessions", "", true); rec.Code != http.StatusOK {
+		t.Fatalf("audown DELETE sessions failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doWrite(http.MethodDelete, "/api/services/audown/users/"+audownUserID, "", true); rec.Code != http.StatusOK {
+		t.Fatalf("audown DELETE user failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// POST invite with spoofed created_by — server MUST overwrite with authenticated operator email!
+	invRec := doWrite(http.MethodPost, "/api/services/audown/invites", `{"display_name":"Eve","ttl_hours":168,"created_by":"spoofed@evil.example"}`, true)
+	if invRec.Code != http.StatusCreated {
+		t.Fatalf("audown POST invite failed: %d %s", invRec.Code, invRec.Body.String())
+	}
+	if invRec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("expected Cache-Control: no-store on invite creation, got %q", invRec.Header().Get("Cache-Control"))
+	}
+	if gotInviteCreatedBy != "owner@cubus.sh" || gotInviteTTL == nil || *gotInviteTTL != 168 {
+		t.Fatalf("expected injected created_by=owner@cubus.sh and ttl=168, got created_by=%q ttl=%v", gotInviteCreatedBy, gotInviteTTL)
+	}
+	if !strings.Contains(invRec.Body.String(), rawInviteURL) {
+		t.Fatalf("expected response body to contain invite_url for operator modal")
+	}
+
+	if rec := doWrite(http.MethodDelete, "/api/services/audown/invites/"+audownInviteID, "", true); rec.Code != http.StatusOK {
+		t.Fatalf("audown DELETE invite failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// POST api-key with spoofed created_by — server MUST overwrite with authenticated operator email!
+	keyRec := doWrite(http.MethodPost, "/api/services/choice/api-keys", `{"name":"CI Pipeline","owner":"platform","expires_in_days":90,"created_by":"spoofed@evil.example"}`, true)
+	if keyRec.Code != http.StatusCreated {
+		t.Fatalf("choice POST api-keys failed: %d %s", keyRec.Code, keyRec.Body.String())
+	}
+	if keyRec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("expected Cache-Control: no-store on api key creation, got %q", keyRec.Header().Get("Cache-Control"))
+	}
+	if gotKeyCreatedBy != "owner@cubus.sh" || gotKeyExpiresDays == nil || *gotKeyExpiresDays != 90 {
+		t.Fatalf("expected injected created_by=owner@cubus.sh and expires=90, got created_by=%q expires=%v", gotKeyCreatedBy, gotKeyExpiresDays)
+	}
+	if !strings.Contains(keyRec.Body.String(), rawAPIKey) {
+		t.Fatalf("expected response body to contain api_key for operator modal")
+	}
+
+	if rec := doWrite(http.MethodPost, "/api/services/choice/api-keys/"+choiceKeyID+"/revoke", "", true); rec.Code != http.StatusOK {
+		t.Fatalf("choice POST revoke failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doWrite(http.MethodDelete, "/api/services/choice/api-keys/"+choiceKeyID, "", true); rec.Code != http.StatusOK {
+		t.Fatalf("choice DELETE api-key failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 7. Audit log completeness + ZERO secret leakage in audit_logs and server logs!
+	audRec := doRead("/api/audit?limit=100")
+	if audRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/audit failed: %d", audRec.Code)
+	}
+	auditBody := audRec.Body.String()
+	for _, secret := range []string{rawInviteTok, rawInviteURL, rawAPIKey} {
+		if strings.Contains(auditBody, secret) {
+			t.Fatalf("SECURITY VIOLATION: secret %q leaked into audit_logs!", secret)
+		}
+		if strings.Contains(logBuf.String(), secret) {
+			t.Fatalf("SECURITY VIOLATION: secret %q leaked into server logs!", secret)
+		}
+	}
+
+	var audResp struct {
+		AuditLogs []store.AuditLog `json:"audit_logs"`
+	}
+	if err := json.Unmarshal(audRec.Body.Bytes(), &audResp); err != nil {
+		t.Fatalf("unmarshal audit logs: %v", err)
+	}
+	seenActions := map[string]store.AuditLog{}
+	for _, row := range audResp.AuditLogs {
+		seenActions[row.Action] = row
+	}
+	wantActions := []string{
+		"user_approve",
+		"user_deny",
+		"user.status_update",
+		"user.sessions_revoke",
+		"user.delete",
+		"invite.create",
+		"invite.delete",
+		"api_key.create",
+		"api_key.revoke",
+		"api_key.delete",
+	}
+	for _, act := range wantActions {
+		if _, ok := seenActions[act]; !ok {
+			t.Fatalf("missing expected audit action %q in %+v", act, seenActions)
+		}
+	}
+	// Verify non-secret metadata IS captured cleanly on invite.create and api_key.create
+	invAudit := seenActions["invite.create"]
+	if invAudit.TargetID != audownInviteID || !strings.Contains(string(invAudit.Details), `"display_name":"Eve"`) || !strings.Contains(string(invAudit.Details), `"ttl_hours":168`) {
+		t.Fatalf("unexpected invite.create audit record: %+v details=%s", invAudit, string(invAudit.Details))
+	}
+	keyAudit := seenActions["api_key.create"]
+	if keyAudit.TargetID != choiceKeyID || !strings.Contains(string(keyAudit.Details), `"key_prefix":"`+keyPrefix+`"`) || !strings.Contains(string(keyAudit.Details), `"owner":"platform"`) {
+		t.Fatalf("unexpected api_key.create audit record: %+v details=%s", keyAudit, string(keyAudit.Details))
 	}
 }

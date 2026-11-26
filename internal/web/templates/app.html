@@ -62,6 +62,19 @@
                 <span class="nav-link-title">Overview &amp; Hardware</span>
               </a>
             </li>
+            <li class="nav-item{{if eq .Page "access"}} active{{end}}">
+              <a class="nav-link" href="/access" id="nav-access">
+                <span class="nav-link-icon d-md-none d-lg-inline-block">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon" aria-hidden="true">
+                    <path d="M9 7m-4 0a4 4 0 1 0 8 0a4 4 0 1 0 -8 0"/>
+                    <path d="M3 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2"/>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                    <path d="M21 21v-2a4 4 0 0 0 -3 -3.85"/>
+                  </svg>
+                </span>
+                <span class="nav-link-title">Users &amp; Access</span>
+              </a>
+            </li>
             <li class="nav-item{{if eq .Page "logs"}} active{{end}}">
               <a class="nav-link" href="/logs">
                 <span class="nav-link-icon d-md-none d-lg-inline-block">
@@ -203,6 +216,51 @@
                 </div>
                 <div class="table-responsive">
                   <table class="table table-vcenter card-table" id="db-table"></table>
+                </div>
+              </div>
+            </section>
+          {{else if eq .Page "access"}}
+            <section id="access">
+              <div id="access-banner" class="alert alert-warning d-none" role="alert"></div>
+              <div id="access-kpi-grid" class="row row-deck row-cards mb-3"></div>
+              <div class="card">
+                <div class="card-header">
+                  <ul id="access-tabs" class="nav nav-tabs card-header-tabs" role="tablist">
+                    <li class="nav-item" role="presentation">
+                      <button id="access-tab-users" class="nav-link active" type="button" role="tab" data-bs-toggle="tab" data-bs-target="#access-pane-users" aria-controls="access-pane-users" aria-selected="true">
+                        <span>Users</span>
+                        <span id="access-badge-users" class="badge bg-secondary-lt ms-2 tabular-nums" title="Total users">0</span>
+                      </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                      <button id="access-tab-invites" class="nav-link" type="button" role="tab" data-bs-toggle="tab" data-bs-target="#access-pane-invites" aria-controls="access-pane-invites" aria-selected="false" tabindex="-1">
+                        <span>Invites</span>
+                        <span id="access-badge-invites" class="badge bg-secondary-lt ms-2 tabular-nums" title="Pending invites">0</span>
+                      </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                      <button id="access-tab-api-keys" class="nav-link" type="button" role="tab" data-bs-toggle="tab" data-bs-target="#access-pane-api-keys" aria-controls="access-pane-api-keys" aria-selected="false" tabindex="-1">
+                        <span>API Keys</span>
+                        <span id="access-badge-api-keys" class="badge bg-secondary-lt ms-2 tabular-nums" title="Active API keys">0</span>
+                      </button>
+                    </li>
+                  </ul>
+                  <div class="card-actions d-flex align-items-center gap-2">
+                    <select id="access-service-filter" class="form-select form-select-sm w-auto" aria-label="Filter by service">
+                      <option value="all">All services</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="tab-content">
+                  <div id="access-pane-users" class="tab-pane active show" role="tabpanel" aria-labelledby="access-tab-users">
+                    <div class="card-body text-secondary">Loading users across services…</div>
+                  </div>
+                  <div id="access-pane-invites" class="tab-pane" role="tabpanel" aria-labelledby="access-tab-invites">
+                    <div class="card-body text-secondary">Loading enrollment invites…</div>
+                  </div>
+                  <div id="access-pane-api-keys" class="tab-pane" role="tabpanel" aria-labelledby="access-tab-api-keys">
+                    <div class="card-body text-secondary">Loading API keys…</div>
+                  </div>
                 </div>
               </div>
             </section>
@@ -401,6 +459,31 @@
               </div>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="secret-modal" class="modal modal-blur fade" tabindex="-1" aria-labelledby="secret-modal-title" aria-hidden="true" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered" role="document">
+      <div class="modal-content">
+        <div class="modal-status bg-warning"></div>
+        <div class="modal-header">
+          <h3 id="secret-modal-title" class="modal-title">One-Time Secret</h3>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <div id="secret-modal-warning" class="alert alert-warning mb-3" role="alert">
+            Copy this secret now. For security reasons, it will not be shown again after you close this dialog.
+          </div>
+          <label id="secret-modal-label" class="form-label" for="secret-modal-input">Secret</label>
+          <div class="input-group mb-2">
+            <input id="secret-modal-input" type="text" class="form-control font-monospace" readonly autocomplete="off" spellcheck="false">
+            <button id="secret-modal-copy" type="button" class="btn btn-primary">Copy</button>
+          </div>
+          <div id="secret-modal-meta" class="text-secondary small"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="secret-modal-close" type="button" class="btn btn-secondary ms-auto" data-bs-dismiss="modal">I have copied it</button>
         </div>
       </div>
     </div>
