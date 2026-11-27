@@ -156,7 +156,7 @@ func TestServiceClientSSRFProxyAndRelPathHardening(t *testing.T) {
 	goodPaths := []string{
 		"/admin/v1/manifest",
 		"/admin/v1/settings",
-		"/admin/v1/classify/batch",
+		"/admin/v1/classify",
 		"/admin/v1/users/u-123/approve",
 		"/admin/v1/artifacts/art-99",
 	}

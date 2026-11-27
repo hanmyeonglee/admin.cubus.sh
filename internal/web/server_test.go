@@ -601,8 +601,9 @@ func TestTablerStaticVendoringAndStrictCSP(t *testing.T) {
 
 func TestLogClassifyAPIAndAmberFallback(t *testing.T) {
 	var choiceFail bool
-	var choiceBatchCalls int
-	var lastBatchItems int
+	var choiceFailNested bool
+	var choiceClassifyCalls int
+	var lastClassifyInputs int
 
 	choiceSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok-choice-secret" {
@@ -613,68 +614,98 @@ func TestLogClassifyAPIAndAmberFallback(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/admin/v1/manifest":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"service":      "choice",
-				"version":      "0.1.0",
+				"version":      "0.2.0",
 				"model":        "amber-150m",
 				"capabilities": []string{"settings", "classify"},
 				"endpoints": map[string]string{
-					"classify_batch": "POST /admin/v1/classify/batch",
+					"classify": "POST /admin/v1/classify",
 				},
 			})
-		case r.Method == http.MethodPost && r.URL.Path == "/admin/v1/classify/batch":
+		case r.Method == http.MethodPost && r.URL.Path == "/admin/v1/classify":
 			if choiceFail {
 				w.WriteHeader(http.StatusServiceUnavailable)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": "GPU worker warming up"})
+				if choiceFailNested {
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"error": map[string]string{
+							"message": "GPU worker warming up (nested)",
+							"type":    "server_error",
+						},
+					})
+				} else {
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "GPU worker warming up"})
+				}
 				return
 			}
-			choiceBatchCalls++
+			choiceClassifyCalls++
 			var req struct {
-				Prompt string            `json:"prompt"`
+				Model  string            `json:"model"`
+				Input  []string          `json:"input"`
 				Labels map[string]string `json:"labels"`
-				Items  []struct {
-					ID   string `json:"id"`
-					Text string `json:"text"`
-				} `json:"items"`
+				Prompt string            `json:"prompt"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				http.Error(w, `{"error":"bad json"}`, http.StatusBadRequest)
 				return
 			}
-			lastBatchItems = len(req.Items)
-			results := make([]map[string]any, 0, len(req.Items))
-			for _, it := range req.Items {
-				choice := "normal"
-				probs := map[string]float64{
-					"normal":            0.90,
-					"operational_error": 0.05,
-					"suspicious_recon":  0.03,
-					"malicious_attack":  0.02,
+			if req.Model != "amber-150m" || len(req.Input) == 0 || len(req.Labels) != 4 || req.Prompt == "" {
+				http.Error(w, `{"error":"invalid classify contract"}`, http.StatusBadRequest)
+				return
+			}
+			lastClassifyInputs = len(req.Input)
+			data := make([]map[string]any, 0, len(req.Input))
+			for idx, text := range req.Input {
+				if strings.Contains(text, "SIMULATE_ITEM_ERROR") {
+					data = append(data, map[string]any{
+						"object": "classification",
+						"index":  idx,
+						"error":  "single item inference timeout",
+					})
+					continue
 				}
-				if strings.Contains(it.Text, "UNION") || strings.Contains(it.Text, "sqlmap") {
-					choice = "malicious_attack"
-					probs = map[string]float64{
-						"normal":            0.01,
-						"operational_error": 0.02,
-						"suspicious_recon":  0.12,
-						"malicious_attack":  0.85,
+				prediction := "normal"
+				score := 0.90
+				preds := []map[string]any{
+					{"label": "normal", "score": 0.90},
+					{"label": "operational_error", "score": 0.05},
+					{"label": "suspicious_recon", "score": 0.03},
+					{"label": "malicious_attack", "score": 0.02},
+				}
+				if strings.Contains(text, "UNION") || strings.Contains(text, "sqlmap") {
+					prediction = "malicious_attack"
+					score = 0.85
+					preds = []map[string]any{
+						{"label": "malicious_attack", "score": 0.85},
+						{"label": "suspicious_recon", "score": 0.12},
+						{"label": "operational_error", "score": 0.02},
+						{"label": "normal", "score": 0.01},
 					}
-				} else if strings.Contains(it.Text, ".env") {
-					choice = "suspicious_recon"
-					probs = map[string]float64{
-						"normal":            0.05,
-						"operational_error": 0.05,
-						"suspicious_recon":  0.80,
-						"malicious_attack":  0.10,
+				} else if strings.Contains(text, ".env") {
+					prediction = "suspicious_recon"
+					score = 0.80
+					preds = []map[string]any{
+						{"label": "suspicious_recon", "score": 0.80},
+						{"label": "malicious_attack", "score": 0.10},
+						{"label": "normal", "score": 0.05},
+						{"label": "operational_error", "score": 0.05},
 					}
 				}
-				results = append(results, map[string]any{
-					"id":            it.ID,
-					"choice":        choice,
-					"probabilities": probs,
+				data = append(data, map[string]any{
+					"object":      "classification",
+					"index":       idx,
+					"prediction":  prediction,
+					"score":       score,
+					"predictions": preds,
 				})
 			}
+			tokens := len(req.Input) * 25
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"model":   "amber-150m",
-				"results": results,
+				"object": "list",
+				"model":  "amber-150m",
+				"data":   data,
+				"usage": map[string]int{
+					"prompt_tokens": tokens,
+					"total_tokens":  tokens,
+				},
 			})
 		default:
 			http.NotFound(w, r)
@@ -859,10 +890,38 @@ func TestLogClassifyAPIAndAmberFallback(t *testing.T) {
 		t.Fatalf("unexpected mode=rules response: %+v", rulesResp)
 	}
 
-	// 4. mode=amber classifies via choice Admin API.
-	amberRec := postClassify(`{"mode":"amber","entries":[{"service":"nginx-proxy","message":"404 /.env","structured":{"status":404,"request":"GET /.env HTTP/2"}}]}`, true)
-	if amberRec.Code != http.StatusOK || choiceBatchCalls != 1 || !strings.Contains(amberRec.Body.String(), `"choice":"suspicious_recon"`) {
+	// 4. mode=amber classifies via choice Admin API (including usage & per-item error propagation).
+	amberRec := postClassify(`{"mode":"amber","entries":[{"service":"nginx-proxy","message":"404 /.env","structured":{"status":404,"request":"GET /.env HTTP/2"}},{"service":"admin","message":"SIMULATE_ITEM_ERROR"}]}`, true)
+	if amberRec.Code != http.StatusOK || choiceClassifyCalls != 1 {
 		t.Fatalf("mode=amber failed: %d %s", amberRec.Code, amberRec.Body.String())
+	}
+	var amberResp struct {
+		AmberEvaluated int `json:"amber_evaluated"`
+		AmberUsage     *struct {
+			PromptTokens int `json:"prompt_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+		} `json:"amber_usage"`
+		Results []struct {
+			Amber *struct {
+				Evaluated     bool               `json:"evaluated"`
+				Choice        string             `json:"choice"`
+				Confidence    float64            `json:"confidence"`
+				Probabilities map[string]float64 `json:"probabilities"`
+				Error         string             `json:"error"`
+			} `json:"amber"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(amberRec.Body.Bytes(), &amberResp); err != nil {
+		t.Fatal(err)
+	}
+	if amberResp.AmberEvaluated != 1 || amberResp.AmberUsage == nil || amberResp.AmberUsage.TotalTokens != 50 {
+		t.Fatalf("unexpected mode=amber metadata: evaluated=%d usage=%+v", amberResp.AmberEvaluated, amberResp.AmberUsage)
+	}
+	if len(amberResp.Results) != 2 || amberResp.Results[0].Amber == nil || amberResp.Results[0].Amber.Choice != "suspicious_recon" || amberResp.Results[0].Amber.Confidence != 0.80 || amberResp.Results[0].Amber.Probabilities["suspicious_recon"] != 0.80 {
+		t.Fatalf("unexpected mode=amber item 0: %+v", amberResp.Results[0].Amber)
+	}
+	if amberResp.Results[1].Amber == nil || amberResp.Results[1].Amber.Evaluated || amberResp.Results[1].Amber.Error != "single item inference timeout" {
+		t.Fatalf("unexpected mode=amber item 1 error: %+v", amberResp.Results[1].Amber)
 	}
 
 	// 5. mode=both on 60 entries caps Amber at 50 and prioritizes rule-flagged entries.
@@ -889,8 +948,8 @@ func TestLogClassifyAPIAndAmberFallback(t *testing.T) {
 	}
 	sixtyRaw, _ := json.Marshal(map[string]any{"mode": "both", "entries": sixty})
 	bothRec := postClassify(string(sixtyRaw), true)
-	if bothRec.Code != http.StatusOK || lastBatchItems != 50 {
-		t.Fatalf("mode=both failed: code=%d lastBatchItems=%d body=%s", bothRec.Code, lastBatchItems, bothRec.Body.String())
+	if bothRec.Code != http.StatusOK || lastClassifyInputs != 50 {
+		t.Fatalf("mode=both failed: code=%d lastClassifyInputs=%d body=%s", bothRec.Code, lastClassifyInputs, bothRec.Body.String())
 	}
 	var bothResp struct {
 		AmberEvaluated int `json:"amber_evaluated"`
@@ -912,7 +971,7 @@ func TestLogClassifyAPIAndAmberFallback(t *testing.T) {
 		t.Fatalf("expected non-nil Amber{Evaluated:false} for unselected entry, got %+v", bothResp.Results[59].Amber)
 	}
 
-	// 6. Upstream choice failure: mode=amber returns 502; mode=both returns 200 with rules + amber_error.
+	// 6. Upstream choice failure: mode=amber returns 502; mode=both returns 200 with rules + amber_error (flat & nested error shapes).
 	choiceFail = true
 	if failAmber := postClassify(`{"mode":"amber","entries":[{"service":"admin","message":"ok"}]}`, true); failAmber.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502 on choice upstream failure in mode=amber, got %d", failAmber.Code)
@@ -922,6 +981,20 @@ func TestLogClassifyAPIAndAmberFallback(t *testing.T) {
 	if bothFallback.Code != http.StatusOK || !strings.Contains(bothFallback.Body.String(), "GPU worker warming up") ||
 		!strings.Contains(bothFallback.Body.String(), `"category":"sqli"`) {
 		t.Fatalf("expected 200 with rules + amber_error in mode=both, got %d %s", bothFallback.Code, bothFallback.Body.String())
+	}
+	choiceFailNested = true
+	bothFallbackNested := postClassify(bothRulesPayload, true)
+	if bothFallbackNested.Code != http.StatusOK || !strings.Contains(bothFallbackNested.Body.String(), "GPU worker warming up (nested)") {
+		t.Fatalf("expected nested OpenAI-style error extraction in mode=both, got %d %s", bothFallbackNested.Code, bothFallbackNested.Body.String())
+	}
+	choiceFailNested = false
+	choiceFail = false
+
+	// Verify extractUpstreamError sanitizes control chars and bounds oversized messages.
+	oversizedFlat, _ := json.Marshal(map[string]string{"error": "bad\n\x00" + strings.Repeat("Z", maxUpstreamErrorRunes+80)})
+	gotErr := extractUpstreamError(oversizedFlat, http.StatusBadGateway, nil)
+	if strings.ContainsAny(gotErr, "\r\n\x00") || len([]rune(gotErr)) > maxUpstreamErrorRunes || !strings.HasSuffix(gotErr, "...") {
+		t.Fatalf("expected sanitized bounded upstream error <= %d runes, got %d %q", maxUpstreamErrorRunes, len([]rune(gotErr)), gotErr)
 	}
 
 	// 7. Unconfigured / unavailable classifier service returns 503 for mode=amber and 200+amber_error for mode=both.
@@ -990,9 +1063,10 @@ func TestLogClassifyAPIAndAmberFallback(t *testing.T) {
 		case "/admin/v1/manifest":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"service": "choice", "model": "amber-150m", "capabilities": []string{"classify"},
+				"endpoints": map[string]string{"classify": "POST /admin/v1/classify"},
 			})
-		case "/admin/v1/classify/batch":
-			_ = json.NewEncoder(w).Encode(map[string]any{"model": "amber-150m", "results": []any{}})
+		case "/admin/v1/classify":
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "model": "amber-150m", "data": []any{}})
 		}
 	}))
 	defer bogusResultsSrv.Close()

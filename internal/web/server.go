@@ -628,10 +628,11 @@ func (s *Server) handleAPILogsClassify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	amberModel := "amber-150m"
+	amberModel := logclassify.AmberDefaultModel
 	amberEvaluated := 0
 	amberErr := ""
 	var amberMap map[int]logclassify.AmberResult
+	var amberUsage *logclassify.AmberUsage
 
 	if mode == "amber" || mode == "both" {
 		// Extend the HTTP server write deadline so cold GPU startup on choice does not time out.
@@ -661,7 +662,7 @@ func (s *Server) handleAPILogsClassify(w http.ResponseWriter, r *http.Request) {
 				}
 			} else {
 				selected := logclassify.SelectAmberIndices(req.Entries, ruleResults, logclassify.MaxAmberBatch)
-				payload, buildErr := logclassify.BuildAmberBatchRequest(req.Entries, selected)
+				payload, buildErr := logclassify.BuildAmberClassifyRequest(req.Entries, selected, amberModel)
 				if buildErr != nil {
 					amberErr = buildErr.Error()
 					if mode == "amber" {
@@ -673,7 +674,7 @@ func (s *Server) handleAPILogsClassify(w http.ResponseWriter, r *http.Request) {
 						r.Context(),
 						status.Service,
 						http.MethodPost,
-						"/admin/v1/classify/batch",
+						"/admin/v1/classify",
 						nil,
 						payload,
 						amberClassifyTimeout,
@@ -685,7 +686,7 @@ func (s *Server) handleAPILogsClassify(w http.ResponseWriter, r *http.Request) {
 							return
 						}
 					} else {
-						parsedModel, parsedResults, parseErr := logclassify.ParseAmberBatchResponse(raw, selected)
+						parsed, parseErr := logclassify.ParseAmberClassifyResponse(raw, selected)
 						if parseErr != nil {
 							amberErr = parseErr.Error()
 							if mode == "amber" {
@@ -693,11 +694,12 @@ func (s *Server) handleAPILogsClassify(w http.ResponseWriter, r *http.Request) {
 								return
 							}
 						} else {
-							if parsedModel != "" {
-								amberModel = parsedModel
+							if parsed.Model != "" {
+								amberModel = parsed.Model
 							}
-							amberMap = parsedResults
-							for _, res := range parsedResults {
+							amberUsage = parsed.Usage
+							amberMap = parsed.Results
+							for _, res := range parsed.Results {
 								if res.Evaluated {
 									amberEvaluated++
 								}
@@ -725,7 +727,7 @@ func (s *Server) handleAPILogsClassify(w http.ResponseWriter, r *http.Request) {
 		results[i] = ec
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	respPayload := map[string]any{
 		"mode":            mode,
 		"duration_ms":     time.Since(start).Milliseconds(),
 		"rule_engine":     s.classifier.Info(),
@@ -734,20 +736,84 @@ func (s *Server) handleAPILogsClassify(w http.ResponseWriter, r *http.Request) {
 		"amber_error":     amberErr,
 		"summary":         logclassify.BuildSummary(results),
 		"results":         results,
-	})
+	}
+	if amberUsage != nil {
+		respPayload["amber_usage"] = amberUsage
+	}
+	writeJSON(w, http.StatusOK, respPayload)
+}
+
+const maxUpstreamErrorRunes = 256
+
+func sanitizeUpstreamError(s string) string {
+	var b strings.Builder
+	b.Grow(min(len(s), maxUpstreamErrorRunes))
+	lastSpace := false
+	runes := 0
+	truncated := false
+	for _, r := range s {
+		if r == utf8.RuneError {
+			continue
+		}
+		if r == '\r' || r == '\n' || r == '\t' || unicode.IsControl(r) || unicode.IsSpace(r) {
+			if !lastSpace && b.Len() > 0 {
+				if runes >= maxUpstreamErrorRunes {
+					truncated = true
+					break
+				}
+				b.WriteByte(' ')
+				runes++
+				lastSpace = true
+			}
+			continue
+		}
+		if runes >= maxUpstreamErrorRunes {
+			truncated = true
+			break
+		}
+		b.WriteRune(r)
+		runes++
+		lastSpace = false
+	}
+	out := strings.TrimSpace(b.String())
+	if truncated && out != "" {
+		// Trim to make room for "..." within maxUpstreamErrorRunes.
+		rs := []rune(out)
+		if len(rs) > maxUpstreamErrorRunes-3 {
+			out = strings.TrimSpace(string(rs[:maxUpstreamErrorRunes-3])) + "..."
+		} else {
+			out += "..."
+		}
+	}
+	return out
 }
 
 func extractUpstreamError(raw json.RawMessage, status int, err error) string {
 	if len(raw) > 0 {
 		var body struct {
-			Error string `json:"error"`
+			Error json.RawMessage `json:"error"`
 		}
-		if json.Unmarshal(raw, &body) == nil && strings.TrimSpace(body.Error) != "" {
-			return strings.TrimSpace(body.Error)
+		if json.Unmarshal(raw, &body) == nil && len(body.Error) > 0 {
+			var flat string
+			if json.Unmarshal(body.Error, &flat) == nil {
+				if msg := sanitizeUpstreamError(flat); msg != "" {
+					return msg
+				}
+			}
+			var nested struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(body.Error, &nested) == nil {
+				if msg := sanitizeUpstreamError(nested.Message); msg != "" {
+					return msg
+				}
+			}
 		}
 	}
 	if err != nil {
-		return err.Error()
+		if msg := sanitizeUpstreamError(err.Error()); msg != "" {
+			return msg
+		}
 	}
 	return fmt.Sprintf("classifier returned HTTP %d", status)
 }

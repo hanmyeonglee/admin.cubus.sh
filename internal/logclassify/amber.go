@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,8 @@ const (
 	MaxAmberItemBytes = 4096
 	MaxAmberBodyBytes = 256 << 10
 
+	AmberDefaultModel = "amber-150m"
+
 	amberMaxServiceBytes  = 64
 	amberMaxLevelBytes    = 16
 	amberMaxClientIPBytes = 64
@@ -26,6 +29,7 @@ const (
 	amberMaxUABytes       = 256
 	amberMaxRefererBytes  = 256
 	amberMaxMsgBytes      = 400
+	amberMaxErrorRunes    = 256
 
 	AmberPrompt = "Classify the security and operational risk category of this server container log entry."
 )
@@ -38,25 +42,39 @@ var AmberLabels = map[string]string{
 	"malicious_attack":  "Active exploit attempt such as SQL injection, XSS, path traversal, command injection, SSRF, JNDI/Log4Shell, or CSRF/auth attack",
 }
 
-type amberBatchItem struct {
-	ID   string `json:"id"`
-	Text string `json:"text"`
-}
-
-type amberBatchRequest struct {
-	Prompt string            `json:"prompt"`
+type amberClassifyRequest struct {
+	Model  string            `json:"model"`
+	Input  []string          `json:"input"`
 	Labels map[string]string `json:"labels"`
-	Items  []amberBatchItem  `json:"items"`
+	Prompt string            `json:"prompt"`
 }
 
-type amberBatchResponse struct {
-	Model   string `json:"model"`
-	Results []struct {
-		ID            string             `json:"id"`
-		Choice        string             `json:"choice,omitempty"`
-		Probabilities map[string]float64 `json:"probabilities,omitempty"`
-		Error         string             `json:"error,omitempty"`
-	} `json:"results"`
+type amberPrediction struct {
+	Label string   `json:"label"`
+	Score *float64 `json:"score"`
+}
+
+type amberClassifyDataItem struct {
+	Object      string            `json:"object,omitempty"`
+	Index       *int              `json:"index"`
+	Prediction  string            `json:"prediction,omitempty"`
+	Score       *float64          `json:"score,omitempty"`
+	Predictions []amberPrediction `json:"predictions,omitempty"`
+	Error       string            `json:"error,omitempty"`
+}
+
+type amberClassifyResponse struct {
+	Object string                  `json:"object,omitempty"`
+	Model  string                  `json:"model"`
+	Data   []amberClassifyDataItem `json:"data"`
+	Usage  *AmberUsage             `json:"usage,omitempty"`
+}
+
+// AmberClassifyParsed holds the parsed result of choice POST /admin/v1/classify.
+type AmberClassifyParsed struct {
+	Model   string
+	Results map[int]AmberResult
+	Usage   *AmberUsage
 }
 
 // BuildAmberText formats a sanitized, field-bounded, safely delimited representation of a log entry for Amber-150M.
@@ -252,52 +270,61 @@ func SelectAmberIndices(entries []LogEntry, ruleResults []RuleResult, limit int)
 	return selected
 }
 
-// BuildAmberBatchRequest builds the JSON payload for choice POST /admin/v1/classify/batch
+// BuildAmberClassifyRequest builds the JSON payload for choice POST /admin/v1/classify
 // using a strict per-item and total UTF-8/JSON byte budget so HTML/UTF-8 expansion cannot exceed MaxAmberBodyBytes.
-func BuildAmberBatchRequest(entries []LogEntry, indices []int) ([]byte, error) {
+// Input strings correspond 1:1 with indices.
+func BuildAmberClassifyRequest(entries []LogEntry, indices []int, model string) ([]byte, error) {
 	if len(indices) == 0 || len(indices) > MaxAmberBatch {
 		return nil, fmt.Errorf("amber batch size %d out of range (1..%d)", len(indices), MaxAmberBatch)
 	}
-	baseRaw, err := marshalJSONNoEscapeHTML(amberBatchRequest{
-		Prompt: AmberPrompt,
+	model = sanitizeSingleLine(model)
+	if model == "" {
+		model = AmberDefaultModel
+	}
+	baseRaw, err := marshalJSONNoEscapeHTML(amberClassifyRequest{
+		Model:  model,
+		Input:  []string{},
 		Labels: AmberLabels,
-		Items:  []amberBatchItem{},
+		Prompt: AmberPrompt,
 	})
 	if err != nil {
 		return nil, err
 	}
-	const itemEnvelopeOverhead = 48
+	const inputSeparatorOverhead = 2
 	remaining := MaxAmberBodyBytes - len(baseRaw)
-	perItemBudget := remaining/len(indices) - itemEnvelopeOverhead
+	perItemBudget := remaining/len(indices) - inputSeparatorOverhead
 	if perItemBudget > MaxAmberItemBytes {
 		perItemBudget = MaxAmberItemBytes
 	}
 	if perItemBudget < 64 {
-		return nil, fmt.Errorf("amber batch payload exceeds %d bytes", MaxAmberBodyBytes)
+		return nil, fmt.Errorf("amber classify payload exceeds %d bytes", MaxAmberBodyBytes)
 	}
 
-	items := make([]amberBatchItem, 0, len(indices))
+	seen := make(map[int]struct{}, len(indices))
+	inputs := make([]string, 0, len(indices))
 	for _, idx := range indices {
 		if idx < 0 || idx >= len(entries) {
 			return nil, fmt.Errorf("amber item index %d out of range", idx)
 		}
+		if _, dup := seen[idx]; dup {
+			return nil, fmt.Errorf("duplicate amber item index %d", idx)
+		}
+		seen[idx] = struct{}{}
 		text := clampJSONEncodedString(BuildAmberText(entries[idx]), perItemBudget)
-		items = append(items, amberBatchItem{
-			ID:   strconv.Itoa(idx),
-			Text: text,
-		})
+		inputs = append(inputs, text)
 	}
-	payload := amberBatchRequest{
-		Prompt: AmberPrompt,
+	payload := amberClassifyRequest{
+		Model:  model,
+		Input:  inputs,
 		Labels: AmberLabels,
-		Items:  items,
+		Prompt: AmberPrompt,
 	}
 	raw, err := marshalJSONNoEscapeHTML(payload)
 	if err != nil {
 		return nil, err
 	}
 	if len(raw) > MaxAmberBodyBytes {
-		return nil, fmt.Errorf("amber batch payload exceeds %d bytes", MaxAmberBodyBytes)
+		return nil, fmt.Errorf("amber classify payload exceeds %d bytes", MaxAmberBodyBytes)
 	}
 	return raw, nil
 }
@@ -344,58 +371,159 @@ func clampJSONEncodedString(s string, maxJSONBytes int) string {
 	return best
 }
 
-// ParseAmberBatchResponse parses and maps choice's /admin/v1/classify/batch response by entry index.
-func ParseAmberBatchResponse(raw []byte, selectedIndices []int) (string, map[int]AmberResult, error) {
-	var resp amberBatchResponse
+func validateAmberScore(v float64) (float64, error) {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0.0 || v > 1.0 {
+		return 0, fmt.Errorf("invalid amber score %v (expected finite value in [0, 1])", v)
+	}
+	if v == 0 {
+		return 0, nil
+	}
+	return v, nil
+}
+
+func sanitizeAmberError(raw string) string {
+	clean := sanitizeSingleLine(raw)
+	if clean == "" {
+		return "classification failed"
+	}
+	if utf8.RuneCountInString(clean) <= amberMaxErrorRunes {
+		return clean
+	}
+	return truncateRunes(clean, amberMaxErrorRunes-3) + "..."
+}
+
+// ParseAmberClassifyResponse parses choice's POST /admin/v1/classify response and maps each data item's
+// positional index back to selectedIndices[item.Index].
+func ParseAmberClassifyResponse(raw []byte, selectedIndices []int) (AmberClassifyParsed, error) {
+	var resp amberClassifyResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", nil, fmt.Errorf("decode amber response: %w", err)
+		return AmberClassifyParsed{}, fmt.Errorf("decode amber response: %w", err)
 	}
-	if len(resp.Results) == 0 {
-		return resp.Model, nil, errors.New("amber classifier returned empty results")
+	return validateAndMapAmberResponse(resp, selectedIndices)
+}
+
+func validateAndMapAmberResponse(resp amberClassifyResponse, selectedIndices []int) (AmberClassifyParsed, error) {
+	if len(selectedIndices) == 0 {
+		return AmberClassifyParsed{}, errors.New("no selected indices provided")
+	}
+	seenEntry := make(map[int]struct{}, len(selectedIndices))
+	for _, entryIdx := range selectedIndices {
+		if entryIdx < 0 {
+			return AmberClassifyParsed{}, fmt.Errorf("invalid selected entry index %d", entryIdx)
+		}
+		if _, dup := seenEntry[entryIdx]; dup {
+			return AmberClassifyParsed{}, fmt.Errorf("duplicate selected entry index %d", entryIdx)
+		}
+		seenEntry[entryIdx] = struct{}{}
 	}
 
-	allowed := make(map[int]struct{}, len(selectedIndices))
-	for _, idx := range selectedIndices {
-		allowed[idx] = struct{}{}
+	if obj := strings.TrimSpace(resp.Object); obj != "" && obj != "list" {
+		return AmberClassifyParsed{}, fmt.Errorf("unexpected amber response object %q", obj)
 	}
 
-	out := make(map[int]AmberResult, len(resp.Results))
-	for _, item := range resp.Results {
-		idx, err := strconv.Atoi(strings.TrimSpace(item.ID))
-		if err != nil {
-			continue
+	model := sanitizeSingleLine(resp.Model)
+	var usage *AmberUsage
+	if resp.Usage != nil {
+		if resp.Usage.PromptTokens < 0 || resp.Usage.TotalTokens < 0 {
+			return AmberClassifyParsed{}, errors.New("amber classifier returned negative token usage")
 		}
-		if _, ok := allowed[idx]; !ok {
-			continue
+		u := *resp.Usage
+		usage = &u
+	}
+
+	if len(resp.Data) == 0 {
+		return AmberClassifyParsed{}, errors.New("amber classifier returned empty data")
+	}
+	if len(resp.Data) != len(selectedIndices) {
+		return AmberClassifyParsed{}, fmt.Errorf("amber classifier returned %d items for %d inputs", len(resp.Data), len(selectedIndices))
+	}
+
+	seenIdx := make([]bool, len(selectedIndices))
+	out := make(map[int]AmberResult, len(resp.Data))
+
+	for i, item := range resp.Data {
+		if item.Index == nil {
+			return AmberClassifyParsed{}, fmt.Errorf("amber classifier data[%d] missing index", i)
 		}
+		idx := *item.Index
+		if idx < 0 || idx >= len(selectedIndices) {
+			return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d out of range [0, %d)", idx, len(selectedIndices))
+		}
+		if seenIdx[idx] {
+			return AmberClassifyParsed{}, fmt.Errorf("amber classifier returned duplicate item index %d", idx)
+		}
+		seenIdx[idx] = true
+		entryIdx := selectedIndices[idx]
+
 		if item.Error != "" {
-			out[idx] = AmberResult{
+			out[entryIdx] = AmberResult{
 				Evaluated: false,
-				Error:     sanitizeSingleLine(item.Error),
+				Error:     sanitizeAmberError(item.Error),
 			}
 			continue
 		}
-		conf := 0.0
-		if item.Probabilities != nil {
-			if p, ok := item.Probabilities[item.Choice]; ok {
-				conf = p
-			} else {
-				for _, p := range item.Probabilities {
-					if p > conf {
-						conf = p
-					}
+
+		if obj := strings.TrimSpace(item.Object); obj != "" && obj != "classification" {
+			return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d has unexpected object %q", idx, obj)
+		}
+
+		choice := sanitizeSingleLine(item.Prediction)
+		if choice == "" {
+			return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d missing prediction", idx)
+		}
+
+		var probs map[string]float64
+		if len(item.Predictions) > 0 {
+			probs = make(map[string]float64, len(item.Predictions))
+			for j, p := range item.Predictions {
+				lbl := sanitizeSingleLine(p.Label)
+				if lbl == "" {
+					return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d predictions[%d] missing label", idx, j)
 				}
+				if p.Score == nil {
+					return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d predictions[%d] missing score", idx, j)
+				}
+				sc, err := validateAmberScore(*p.Score)
+				if err != nil {
+					return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d label %q: %w", idx, lbl, err)
+				}
+				if _, dup := probs[lbl]; dup {
+					return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d has duplicate prediction label %q", idx, lbl)
+				}
+				probs[lbl] = sc
+			}
+			if _, ok := probs[choice]; !ok {
+				return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d prediction %q missing from predictions", idx, choice)
 			}
 		}
-		out[idx] = AmberResult{
-			Choice:        item.Choice,
-			Probabilities: item.Probabilities,
+
+		var conf float64
+		if item.Score != nil {
+			sc, err := validateAmberScore(*item.Score)
+			if err != nil {
+				return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d: %w", idx, err)
+			}
+			conf = sc
+			if probs == nil {
+				probs = map[string]float64{choice: conf}
+			}
+		} else if len(probs) > 0 {
+			conf = probs[choice]
+		} else {
+			return AmberClassifyParsed{}, fmt.Errorf("amber classifier item index %d missing score and predictions", idx)
+		}
+
+		out[entryIdx] = AmberResult{
+			Choice:        choice,
+			Probabilities: probs,
 			Confidence:    conf,
-			Evaluated:     item.Choice != "",
+			Evaluated:     true,
 		}
 	}
-	if len(out) == 0 {
-		return resp.Model, nil, errors.New("amber classifier returned no matching item IDs")
-	}
-	return resp.Model, out, nil
+
+	return AmberClassifyParsed{
+		Model:   model,
+		Results: out,
+		Usage:   usage,
+	}, nil
 }

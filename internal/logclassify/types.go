@@ -87,6 +87,12 @@ type AmberResult struct {
 	Evaluated     bool               `json:"evaluated"`
 }
 
+// AmberUsage holds token usage metrics returned by choice POST /admin/v1/classify.
+type AmberUsage struct {
+	PromptTokens int `json:"prompt_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
 // EntryClassification combines rule and optional Amber AI results per entry index.
 type EntryClassification struct {
 	Index int          `json:"index"`

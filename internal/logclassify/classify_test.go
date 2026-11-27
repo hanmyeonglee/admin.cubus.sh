@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"math"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestNewEngineLoadsEmbeddedRulesAndZeroFalsePositivesOnNormalTraffic(t *testing.T) {
@@ -816,9 +816,9 @@ func TestAmberBoundaryAndSummary(t *testing.T) {
 					Message: tc.msg,
 				}
 			}
-			raw, err := BuildAmberBatchRequest(entries, idx)
+			raw, err := BuildAmberClassifyRequest(entries, idx, "")
 			if err != nil {
-				t.Fatalf("BuildAmberBatchRequest failed on %s: %v", tc.name, err)
+				t.Fatalf("BuildAmberClassifyRequest failed on %s: %v", tc.name, err)
 			}
 			if len(raw) > MaxAmberBodyBytes {
 				t.Fatalf("expected payload <= %d bytes, got %d", MaxAmberBodyBytes, len(raw))
@@ -829,9 +829,14 @@ func TestAmberBoundaryAndSummary(t *testing.T) {
 		})
 	}
 
-	// Mismatched item IDs in response must return error.
-	if _, _, err := ParseAmberBatchResponse([]byte(`{"model":"amber-150m","results":[{"id":"999","choice":"normal"}]}`), []int{0}); err == nil {
-		t.Fatalf("expected error when no response IDs match selected indices")
+	// Out-of-range item index in response must return error.
+	if _, err := ParseAmberClassifyResponse([]byte(`{"object":"list","model":"amber-150m","data":[{"object":"classification","index":999,"prediction":"normal","score":0.9}]}`), []int{0}); err == nil {
+		t.Fatalf("expected error when response index is out of range")
+	}
+
+	// Duplicate indices in request must be rejected.
+	if _, err := BuildAmberClassifyRequest([]LogEntry{{Service: "admin", Message: "ok"}}, []int{0, 0}, AmberDefaultModel); err == nil {
+		t.Fatalf("expected error for duplicate request indices")
 	}
 
 	summary := BuildSummary([]EntryClassification{
@@ -875,38 +880,83 @@ func TestAmberSelectionRequestAndParsing(t *testing.T) {
 		t.Fatalf("expected priority indices 2 and 5 to be selected, got %v", selected)
 	}
 
-	body, err := BuildAmberBatchRequest(entries, selected)
+	body, err := BuildAmberClassifyRequest(entries, selected, "")
 	if err != nil {
-		t.Fatalf("BuildAmberBatchRequest failed: %v", err)
+		t.Fatalf("BuildAmberClassifyRequest failed: %v", err)
 	}
-	var reqObj amberBatchRequest
+	var reqObj amberClassifyRequest
 	if err := json.Unmarshal(body, &reqObj); err != nil {
 		t.Fatal(err)
 	}
-	if len(reqObj.Items) != MaxAmberBatch || len(reqObj.Labels) != 4 {
-		t.Fatalf("unexpected amber batch payload: items=%d labels=%d", len(reqObj.Items), len(reqObj.Labels))
+	if reqObj.Model != AmberDefaultModel || reqObj.Prompt != AmberPrompt || len(reqObj.Input) != MaxAmberBatch || len(reqObj.Labels) != 4 {
+		t.Fatalf("unexpected amber classify payload: model=%q prompt=%q inputs=%d labels=%d", reqObj.Model, reqObj.Prompt, len(reqObj.Input), len(reqObj.Labels))
+	}
+	// Verify 1:1 ordering between selected indices and reqObj.Input.
+	pos2 := slices.Index(selected, 2)
+	pos5 := slices.Index(selected, 5)
+	if !strings.Contains(reqObj.Input[pos2], "/ok-2") || !strings.Contains(reqObj.Input[pos5], "level=error") {
+		t.Fatalf("input slice does not align 1:1 with selected indices: input[%d]=%q input[%d]=%q", pos2, reqObj.Input[pos2], pos5, reqObj.Input[pos5])
 	}
 
-	// Test ParseAmberBatchResponse with an item-level error and valid item.
+	// Test ParseAmberClassifyResponse with sparse out-of-order indices, per-item error, and usage.
+	sparseSelected := []int{2, 5, 9}
 	rawResp := []byte(`{
+		"object": "list",
 		"model": "amber-150m",
-		"results": [
-			{"id": "2", "choice": "malicious_attack", "probabilities": {"normal": 0.01, "operational_error": 0.02, "suspicious_recon": 0.12, "malicious_attack": 0.85}},
-			{"id": "5", "error": "item failed"}
-		]
+		"data": [
+			{
+				"object": "classification",
+				"index": 2,
+				"prediction": "normal",
+				"score": 0.94,
+				"predictions": [
+					{"label": "normal", "score": 0.94},
+					{"label": "operational_error", "score": 0.03},
+					{"label": "suspicious_recon", "score": 0.02},
+					{"label": "malicious_attack", "score": 0.01}
+				]
+			},
+			{
+				"object": "classification",
+				"index": 0,
+				"prediction": "malicious_attack",
+				"score": 0.96,
+				"predictions": [
+					{"label": "malicious_attack", "score": 0.96},
+					{"label": "suspicious_recon", "score": 0.03},
+					{"label": "operational_error", "score": 0.005},
+					{"label": "normal", "score": 0.005}
+				]
+			},
+			{
+				"object": "classification",
+				"index": 1,
+				"error": "item failed\nwith newline"
+			}
+		],
+		"usage": {
+			"prompt_tokens": 200,
+			"total_tokens": 200
+		}
 	}`)
-	model, parsed, err := ParseAmberBatchResponse(rawResp, selected)
+	parsed, err := ParseAmberClassifyResponse(rawResp, sparseSelected)
 	if err != nil {
-		t.Fatalf("ParseAmberBatchResponse failed: %v", err)
+		t.Fatalf("ParseAmberClassifyResponse failed: %v", err)
 	}
-	if model != "amber-150m" {
-		t.Fatalf("unexpected model %q", model)
+	if parsed.Model != "amber-150m" {
+		t.Fatalf("unexpected model %q", parsed.Model)
 	}
-	if !parsed[2].Evaluated || parsed[2].Choice != "malicious_attack" || parsed[2].Confidence != 0.85 {
-		t.Fatalf("unexpected parsed result[2]: %+v", parsed[2])
+	if parsed.Usage == nil || parsed.Usage.PromptTokens != 200 || parsed.Usage.TotalTokens != 200 {
+		t.Fatalf("unexpected usage: %+v", parsed.Usage)
 	}
-	if parsed[5].Evaluated || parsed[5].Error != "item failed" {
-		t.Fatalf("unexpected parsed result[5]: %+v", parsed[5])
+	if !parsed.Results[2].Evaluated || parsed.Results[2].Choice != "malicious_attack" || parsed.Results[2].Confidence != 0.96 || parsed.Results[2].Probabilities["malicious_attack"] != 0.96 || parsed.Results[2].Probabilities["normal"] != 0.005 {
+		t.Fatalf("unexpected parsed result[2]: %+v", parsed.Results[2])
+	}
+	if parsed.Results[5].Evaluated || parsed.Results[5].Error != "item failed with newline" {
+		t.Fatalf("unexpected parsed result[5]: %+v", parsed.Results[5])
+	}
+	if !parsed.Results[9].Evaluated || parsed.Results[9].Choice != "normal" || parsed.Results[9].Confidence != 0.94 {
+		t.Fatalf("unexpected parsed result[9]: %+v", parsed.Results[9])
 	}
 
 	// Ensure BuildAmberText safely truncates long messages to MaxAmberItemChars.
@@ -919,13 +969,148 @@ func TestAmberSelectionRequestAndParsing(t *testing.T) {
 	if len([]rune(txt)) > MaxAmberItemChars {
 		t.Fatalf("expected <= %d runes, got %d", MaxAmberItemChars, len([]rune(txt)))
 	}
+}
 
-	// Verify httptest mock server compatibility check.
-	mockChoice := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(rawResp)
-	}))
-	defer mockChoice.Close()
+func TestParseAmberClassifyResponseValidationEdgeCases(t *testing.T) {
+	selected := []int{10, 20}
+
+	rejectCases := []struct {
+		name string
+		raw  string
+	}{
+		{"empty data", `{"object":"list","model":"amber-150m","data":[]}`},
+		{"incomplete truncated data", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9}]}`},
+		{"too many data items", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9},{"index":1,"prediction":"normal","score":0.9},{"index":2,"prediction":"normal","score":0.9}]}`},
+		{"missing index", `{"object":"list","model":"amber-150m","data":[{"object":"classification","prediction":"normal","score":0.9},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"negative index", `{"object":"list","model":"amber-150m","data":[{"index":-1,"prediction":"normal","score":0.9},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"out of range index", `{"object":"list","model":"amber-150m","data":[{"index":2,"prediction":"normal","score":0.9},{"index":0,"prediction":"normal","score":0.9}]}`},
+		{"duplicate index", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9},{"index":0,"prediction":"normal","score":0.8}]}`},
+		{"duplicate index with error item", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9},{"index":0,"error":"boom"}]}`},
+		{"unexpected top-level object", `{"object":"error","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"unexpected item object", `{"object":"list","model":"amber-150m","data":[{"object":"embedding","index":0,"prediction":"normal","score":0.9},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"missing prediction", `{"object":"list","model":"amber-150m","data":[{"index":0,"score":0.9},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"missing score and predictions", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal"},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"prediction missing from predictions with score", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"malicious_attack","score":0.9,"predictions":[{"label":"normal","score":0.9}]},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"prediction missing from predictions without score", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"malicious_attack","predictions":[{"label":"normal","score":0.9}]},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"score below zero", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":-0.01},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"score above one", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":1.001},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"score huge float", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":1e308},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"score literal NaN", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":NaN},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"score literal Infinity", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":Infinity},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"prediction score below zero", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9,"predictions":[{"label":"normal","score":-0.1}]},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"prediction score above one", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9,"predictions":[{"label":"normal","score":1.2}]},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"prediction missing score", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9,"predictions":[{"label":"normal"}]},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"prediction empty label", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9,"predictions":[{"label":"  ","score":0.9}]},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"prediction duplicate label", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9,"predictions":[{"label":"normal","score":0.9},{"label":"normal","score":0.1}]},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"negative prompt tokens", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9},{"index":1,"prediction":"normal","score":0.9}],"usage":{"prompt_tokens":-1,"total_tokens":10}}`},
+		{"negative total tokens", `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"normal","score":0.9},{"index":1,"prediction":"normal","score":0.9}],"usage":{"prompt_tokens":10,"total_tokens":-1}}`},
+		{"float index", `{"object":"list","model":"amber-150m","data":[{"index":0.5,"prediction":"normal","score":0.9},{"index":1,"prediction":"normal","score":0.9}]}`},
+		{"string index", `{"object":"list","model":"amber-150m","data":[{"index":"0","prediction":"normal","score":0.9},{"index":1,"prediction":"normal","score":0.9}]}`},
+	}
+
+	for _, tc := range rejectCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseAmberClassifyResponse([]byte(tc.raw), selected); err == nil {
+				t.Fatalf("expected error for %s, got nil", tc.name)
+			}
+		})
+	}
+
+	// Verify in-memory NaN / +Inf / -Inf rejection in validateAndMapAmberResponse (both item.Score and predictions).
+	idx0 := 0
+	singleSelected := []int{10}
+	for _, bad := range []struct {
+		name string
+		val  float64
+	}{
+		{"NaN", math.NaN()},
+		{"+Inf", math.Inf(1)},
+		{"-Inf", math.Inf(-1)},
+		{"negative", -0.0001},
+		{"gt1", 1.0001},
+	} {
+		t.Run("in_memory_score_"+bad.name, func(t *testing.T) {
+			v := bad.val
+			resp := amberClassifyResponse{
+				Object: "list",
+				Model:  AmberDefaultModel,
+				Data: []amberClassifyDataItem{
+					{Object: "classification", Index: &idx0, Prediction: "normal", Score: &v},
+				},
+			}
+			if _, err := validateAndMapAmberResponse(resp, singleSelected); err == nil {
+				t.Fatalf("expected error for item.Score=%v", bad.val)
+			}
+		})
+		t.Run("in_memory_prediction_score_"+bad.name, func(t *testing.T) {
+			okScore := 0.9
+			v := bad.val
+			resp := amberClassifyResponse{
+				Object: "list",
+				Model:  AmberDefaultModel,
+				Data: []amberClassifyDataItem{
+					{
+						Object:      "classification",
+						Index:       &idx0,
+						Prediction:  "normal",
+						Score:       &okScore,
+						Predictions: []amberPrediction{{Label: "normal", Score: &v}},
+					},
+				},
+			}
+			if _, err := validateAndMapAmberResponse(resp, singleSelected); err == nil {
+				t.Fatalf("expected error for predictions[0].Score=%v", bad.val)
+			}
+		})
+	}
+
+	// Valid fallback cases: score omitted (derived from predictions), predictions omitted (synthesized from score), usage omitted.
+	t.Run("score_derived_from_predictions", func(t *testing.T) {
+		raw := `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"suspicious_recon","predictions":[{"label":"suspicious_recon","score":0.82},{"label":"normal","score":0.18}]}]}`
+		parsed, err := ParseAmberClassifyResponse([]byte(raw), []int{10})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if parsed.Usage != nil {
+			t.Fatalf("expected nil usage when omitted, got %+v", parsed.Usage)
+		}
+		res := parsed.Results[10]
+		if !res.Evaluated || res.Choice != "suspicious_recon" || res.Confidence != 0.82 || res.Probabilities["normal"] != 0.18 {
+			t.Fatalf("unexpected result: %+v", res)
+		}
+	})
+
+	t.Run("predictions_omitted_uses_score", func(t *testing.T) {
+		raw := `{"object":"list","model":"amber-150m","data":[{"index":0,"prediction":"operational_error","score":0.75}]}`
+		parsed, err := ParseAmberClassifyResponse([]byte(raw), []int{20})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		res := parsed.Results[20]
+		if !res.Evaluated || res.Choice != "operational_error" || res.Confidence != 0.75 || res.Probabilities["operational_error"] != 0.75 {
+			t.Fatalf("unexpected result: %+v", res)
+		}
+	})
+
+	t.Run("per_item_error_sanitized_and_bounded", func(t *testing.T) {
+		longErr := "line1\n\x00line2 " + strings.Repeat("x", amberMaxErrorRunes+100)
+		raw, err := json.Marshal(map[string]any{
+			"object": "list",
+			"model":  "amber-150m",
+			"data":   []map[string]any{{"index": 0, "error": longErr}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseAmberClassifyResponse(raw, []int{7})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := parsed.Results[7].Error
+		if parsed.Results[7].Evaluated || strings.ContainsAny(got, "\r\n\x00") || utf8.RuneCountInString(got) > amberMaxErrorRunes || !strings.HasSuffix(got, "...") {
+			t.Fatalf("expected sanitized & bounded error <= %d runes, got len=%d %q", amberMaxErrorRunes, utf8.RuneCountInString(got), got)
+		}
+	})
 }
 
 func TestClassifyBatchConcurrencyRace(t *testing.T) {
